@@ -54,75 +54,7 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 # ⭐ MUHIM: Payme cheklar keladigan guruh ID si
 PAYME_RECEIPTS_GROUP_ID = os.getenv("PAYME_RECEIPTS_GROUP_ID", "")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start handler"""
-    user = update.effective_user
-    
-    # ⭐ DEBUG: Kim start bosayotganini ko'rish
-    logger.info(f"🚀 /start - User ID: {user.id}, Admin ID: {ADMIN_CHAT_ID_INT}")
-    
-    is_admin = (user.id == ADMIN_CHAT_ID_INT)
-    
-    if is_admin:
-        keyboard = [
-            [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
-            [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
-            [InlineKeyboardButton("🍽️ Menyu ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
-        ]
-        
-        welcome_text = (
-            f"👋 <b>Salom, Admin {user.first_name}!</b>\n\n"
-            f"🤖 <b>BODRUM</b> admin paneliga xush kelibsiz!\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        return
-    
-    # Oddiy foydalanuvchi
-    profile = get_user_profile(user.id)
-    
-    if profile and profile.get('phone'):
-        name = profile.get('name', 'Foydalanuvchi')
-        phone = profile.get('phone', '')
-        
-        # Telefon formatini chiroyli qilish
-        formatted_phone = phone
-        if len(phone) == 9:
-            formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
-        
-        keyboard = [
-            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
-        ]
-        
-        await update.message.reply_text(
-            f"👋 Salom, <b>{name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📞 Telefon: +998 {formatted_phone}\n\n"
-            f"🛒 Menyudan buyurtma berishingiz mumkin:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-    else:
-        # Ro'yxatdan o'tmagan foydalanuvchi
-        keyboard = ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-        
-        await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
+
 
 # ⭐ YANGI: Guruh ID sini to'g'ri parse qilish
 def parse_chat_id(chat_id_str):
@@ -270,6 +202,76 @@ def get_db_connection():
         logger.error(f"Database connection error: {e}")
         raise
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start handler"""
+    user = update.effective_user
+    
+    # ⭐ DEBUG: Kim start bosayotganini ko'rish
+    logger.info(f"🚀 /start - User ID: {user.id}, Admin ID: {ADMIN_CHAT_ID_INT}")
+    
+    is_admin = (user.id == ADMIN_CHAT_ID_INT)
+    
+    if is_admin:
+        keyboard = [
+            [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
+            [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
+            [InlineKeyboardButton("🍽️ Menyu ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
+        ]
+        
+        welcome_text = (
+            f"👋 <b>Salom, Admin {user.first_name}!</b>\n\n"
+            f"🤖 <b>BODRUM</b> admin paneliga xush kelibsiz!\n\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        return
+    
+    # Oddiy foydalanuvchi
+    profile = get_user_profile(user.id)
+    
+    if profile and profile.get('phone'):
+        name = profile.get('name', 'Foydalanuvchi')
+        phone = profile.get('phone', '')
+        
+        # Telefon formatini chiroyli qilish
+        formatted_phone = phone
+        if len(phone) == 9:
+            formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ]
+        
+        await update.message.reply_text(
+            f"👋 Salom, <b>{name}</b>!\n\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+            f"📞 Telefon: +998 {formatted_phone}\n\n"
+            f"🛒 Menyudan buyurtma berishingiz mumkin:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    else:
+        # Ro'yxatdan o'tmagan foydalanuvchi
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        
+        await update.message.reply_text(
+            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+            f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
 # ==========================================
 # TELEGRAM BOT API DIRECT FUNCTIONS
 # ==========================================
