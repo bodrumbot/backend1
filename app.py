@@ -1,3 +1,8 @@
+# ==========================================
+# BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
+# To'g'rilangan versiya - Guruh handleri fixparse_payme_receipt
+# ==========================================
+
 import os
 import logging
 import asyncio
@@ -1127,14 +1132,17 @@ async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         if updated_order:
+            # Mijoz ismini olish (backslash muammosini oldini olish uchun)
+            customer_name = order.get('name') or "Mijoz"
+            
             # Admin ga tasdiqlash xabarini yuborish
             admin_confirm_msg = (
-                f"✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
+                "✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
                 f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                f"👤 Mijoz: {order.get('name', 'Noma\'lum')}\n"
+                f"👤 Mijoz: {customer_name}\n"
                 f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
                 f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-                f"📨 Mijozga xabar yuborildi!"
+                "📨 Mijozga xabar yuborildi!"
             )
             
             await update.message.reply_text(admin_confirm_msg, parse_mode='HTML')
@@ -1177,20 +1185,29 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
         if isinstance(items, str):
             items = json.loads(items)
         
-        items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]])
-        if len(items) > 3:
-            items_short += f" va yana {len(items)-3} ta"
+        # Mahsulotlarni qisqa ro'yxatga olish
+        if items:
+            items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]])
+            if len(items) > 3:
+                items_short += f" va yana {len(items)-3} ta"
+        else:
+            items_short = "Ma'lumot yo'q"
+        
+        # Vaqt formatini tashqarida olish (f-string ichida emas)
+        current_time = datetime.now().strftime('%H:%M')
+        order_id_short = str(order.get('order_id', 'N/A'))[-6:]
+        total_price = format_price(order.get('total', 0))
         
         customer_message = (
-            f"🎉 <b>Buyurtmangiz qabul qilindi!</b>\n\n"
-            f"🆔 <b>Buyurtma raqami:</b> #{str(order.get('order_id', 'N/A'))[-6:]}\n"
+            "🎉 <b>Buyurtmangiz qabul qilindi!</b>\n\n"
+            f"🆔 <b>Buyurtma raqami:</b> #{order_id_short}\n"
             f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
-            f"💵 <b>Summa:</b> {format_price(order.get('total', 0))} so'm\n\n"
-            f"🍽 <b>Buyurtma:</b>\n{items_short}\n\n"
-            f"👨‍🍳 Oshxonada tayyorlanmoqda...\n"
-            f"🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
-            f"📞 Savollar bo'yicha: +998901234567\n"
-            f"⏰ {datetime.now().strftime('%H:%M')}"
+            f"💵 <b>Summa:</b> {total_price} so'm\n\n"
+            f"🍽 <b>Buyurtma:</b> {items_short}\n\n"
+            "👨‍🍳 Oshxonada tayyorlanmoqda...\n"
+            "🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
+            "📞 Savollar bo'yicha: +998901234567\n"
+            f"⏰ {current_time}"
         )
         
         # Mijozga xabar yuborish
@@ -1212,12 +1229,11 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Barcha callback query larni qayta ishlash.
-    Bu yerda tugma bosilganlarida bajariladigan amallar mavjud.
     """
     query = update.callback_query
     user = update.effective_user
     
-    # Har doim callback query ga javob qaytarish (telegram talabi)
+    # Har doim callback query ga javob qaytarish
     try:
         await query.answer()
     except Exception as e:
@@ -1272,12 +1288,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         
         await query.edit_message_text(
-            f"💳 <b>To'lovni tekshirish</b>\n\n"
+            "💳 <b>To'lovni tekshirish</b>\n\n"
             f"🆔 Buyurtma: #{order_id[-6:]}\n"
             f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-            f"Quyidagi ORDER ID ni Payme guruhida qidiring:\n"
+            "Quyidagi ORDER ID ni Payme guruhida qidiring:\n"
             f"<code>{order_id}</code>\n\n"
-            f"To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.",
+            "To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.",
             reply_markup=keyboard,
             parse_mode='HTML'
         )
@@ -1300,6 +1316,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         phone_display = format_phone_display(order.get('phone', ''))
         
+        # State larni oldini olish uchun qiymatlarni olish
+        order_id_val = order.get('order_id', 'N/A')
+        customer_name = order.get('name', 'Mijoz')
+        total_val = order.get('total', 0)
+        
         location_text = ""
         location = order.get('location')
         if location and ',' in str(location):
@@ -1313,10 +1334,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         message = (
             f"{status_text}\n\n"
-            f"🆔 Buyurtma: #{order_id[-6:]}\n"
-            f"👤 Mijoz: {order.get('name')}\n"
+            f"🆔 Buyurtma: #{order_id_val[-6:]}\n"
+            f"👤 Mijoz: {customer_name}\n"
             f"📞 Telefon: {phone_display}\n"
-            f"💵 Summa: {format_price(order.get('total', 0))} so'm"
+            f"💵 Summa: {format_price(total_val)} so'm"
             f"{location_text}\n\n"
             f"🍽 Mahsulotlar:\n{items_text}\n\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
@@ -1364,13 +1385,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         
         prompt_message = (
-            f"⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
+            "⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
             f"🆔 Buyurtma: #{order_id[-6:]}\n"
-            f"👤 Mijoz: {order.get('name')}\n"
+            f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
             f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
             f"🍽 Mahsulotlar:\n{items_text}\n\n"
-            f"✍️ <b>Tayyorlanish vaqtini kiriting:</b>\n"
-            f"<i>Masalan:</i> <code>20 daqiqa</code>, <code>30-40 daqiqa</code>, <code>1 soat</code>"
+            "✍️ <b>Tayyorlanish vaqtini kiriting:</b>\n"
+            "<i>Masalan:</i> <code>20 daqiqa</code>, <code>30-40 daqiqa</code>, <code>1 soat</code>"
         )
         
         await query.edit_message_text(
@@ -1393,12 +1414,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated = update_order_status(order_id, 'rejected', rejected_at=datetime.utcnow())
         
         if updated:
+            current_time = datetime.now().strftime('%H:%M:%S')
             # Admin ga tasdiq
             await query.edit_message_text(
-                f"❌ <b>BUYURTMA BEKOR QILINDI</b>\n\n"
+                "❌ <b>BUYURTMA BEKOR QILINDI</b>\n\n"
                 f"🆔 #{order_id[-6:]}\n"
-                f"👤 {order.get('name')}\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                f"👤 {order.get('name', 'Mijoz')}\n"
+                f"⏰ {current_time}",
                 parse_mode='HTML'
             )
             
@@ -1409,9 +1431,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(
                         chat_id=int(tg_id),
                         text=(
-                            f"❌ <b>Buyurtmangiz bekor qilindi</b>\n\n"
+                            "❌ <b>Buyurtmangiz bekor qilindi</b>\n\n"
                             f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                            f"📞 Qo'llab-quvvatlash: +998901234567"
+                            "📞 Qo'llab-quvvatlash: +998901234567"
                         ),
                         parse_mode='HTML'
                     )
@@ -1434,10 +1456,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated = update_order_status(order_id, 'confirmed', confirmed_at=datetime.utcnow())
         
         if updated:
+            current_time = datetime.now().strftime('%H:%M:%S')
             await query.edit_message_text(
-                f"✅✅ <b>BUYURTMA TASDIQLANDI</b>\n\n"
+                "✅✅ <b>BUYURTMA TASDIQLANDI</b>\n\n"
                 f"🆔 #{order_id[-6:]}\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                f"⏰ {current_time}",
                 parse_mode='HTML'
             )
             
@@ -1448,9 +1471,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(
                         chat_id=int(tg_id),
                         text=(
-                            f"✅✅ <b>Buyurtmangiz tayyor!</b>\n\n"
+                            "✅✅ <b>Buyurtmangiz tayyor!</b>\n\n"
                             f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                            f"🚚 Tez orada yetkazib beramiz!"
+                            "🚚 Tez orada yetkazib beramiz!"
                         ),
                         parse_mode='HTML'
                     )
