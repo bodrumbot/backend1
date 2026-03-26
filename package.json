@@ -1,0 +1,12 @@
+{
+  "name": "bodrum-payme-callback",
+  "version": "1.0.0",
+  "description": "Payme callback handler for Railway PostgreSQL",
+  "main": "payme-callback.js",
+  "dependencies": {
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
