@@ -1083,44 +1083,194 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode='HTML'
     )
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback query handler"""
-    query = update.callback_query
+async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin tayyorlanish vaqtini kiritganda ishga tushadi.
+    Bu funksiya faqat admin tomonidan buyurtma qabul qilish jarayonida vaqt kiritilganda chaqiriladi.
+    """
+    user = update.effective_user
     
-    # ⭐ MUHIM: Har doim answer() chaqirish
+    # Faqat admin uchun tekshiruv
+    if user.id != ADMIN_CHAT_ID_INT:
+        return
+    
+    # Kutilayotgan state mavjudmi tekshirish
+    if not context.user_data.get('awaiting_prep_time'):
+        return
+    
+    order_id = context.user_data.get('accepting_order_id')
+    prep_time = update.message.text.strip()
+    
+    if not order_id:
+        await update.message.reply_text("❌ Xatolik: Buyurtma ID topilmadi!")
+        context.user_data.pop('awaiting_prep_time', None)
+        context.user_data.pop('accepting_order_id', None)
+        return
+    
+    # Buyurtma ma'lumotlarini olish
+    order = get_order(order_id)
+    if not order:
+        await update.message.reply_text("❌ Xatolik: Buyurtma ma'lumotlar bazasidan topilmadi!")
+        context.user_data.pop('awaiting_prep_time', None)
+        context.user_data.pop('accepting_order_id', None)
+        return
+    
+    # Buyurtma allaqachon qabul qilinganmi tekshirish
+    if order.get('status') == 'accepted':
+        await update.message.reply_text("⚠️ Bu buyurtma allaqachon qabul qilingan!")
+        context.user_data.pop('awaiting_prep_time', None)
+        context.user_data.pop('accepting_order_id', None)
+        return
+    
+    try:
+        # Buyurtma statusini yangilash (accepted + tayyorlanish vaqti)
+        updated_order = update_order_status(
+            order_id, 
+            'accepted',
+            admin_note=f"Tayyorlanish vaqti: {prep_time}",
+            accepted_at=datetime.utcnow()
+        )
+        
+        if updated_order:
+            # Admin ga tasdiqlash xabarini yuborish
+            admin_confirm_msg = (
+                f"✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
+                f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                f"👤 Mijoz: {order.get('name', 'Noma\'lum')}\n"
+                f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
+                f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
+                f"📨 Mijozga xabar yuborildi!"
+            )
+            
+            await update.message.reply_text(admin_confirm_msg, parse_mode='HTML')
+            
+            # Mijozga xabar yuborish
+            await notify_customer_accepted(context.bot, order, prep_time)
+            
+        else:
+            await update.message.reply_text(
+                "❌ <b>Xatolik!</b>\nBuyurtma ma'lumotlar bazasida yangilanmadi.",
+                parse_mode='HTML'
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Buyurtma qabul qilishda xato: {e}")
+        await update.message.reply_text(
+            "❌ <b>Kutilmagan xatolik yuz berdi!</b>\nIltimos, qayta urinib ko'ring.",
+            parse_mode='HTML'
+        )
+    
+    finally:
+        # State ni tozalash
+        context.user_data.pop('awaiting_prep_time', None)
+        context.user_data.pop('accepting_order_id', None)
+
+async def notify_customer_accepted(bot, order: Dict, prep_time: str):
+    """
+    Buyurtma qabul qilinganda mijozga xabar yuboradi.
+    Tayyorlanish vaqti bilan birga yuboriladi.
+    """
+    tg_id = order.get('tg_id')
+    
+    if not tg_id or str(tg_id) in ['0', 'None', '', 'null']:
+        logger.warning(f"⚠️ Mijoz tg_id yo'q: {order.get('order_id')}")
+        return False
+    
+    try:
+        # Xabar matnini tayyorlash
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]])
+        if len(items) > 3:
+            items_short += f" va yana {len(items)-3} ta"
+        
+        customer_message = (
+            f"🎉 <b>Buyurtmangiz qabul qilindi!</b>\n\n"
+            f"🆔 <b>Buyurtma raqami:</b> #{str(order.get('order_id', 'N/A'))[-6:]}\n"
+            f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
+            f"💵 <b>Summa:</b> {format_price(order.get('total', 0))} so'm\n\n"
+            f"🍽 <b>Buyurtma:</b>\n{items_short}\n\n"
+            f"👨‍🍳 Oshxonada tayyorlanmoqda...\n"
+            f"🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
+            f"📞 Savollar bo'yicha: +998901234567\n"
+            f"⏰ {datetime.now().strftime('%H:%M')}"
+        )
+        
+        # Mijozga xabar yuborish
+        await bot.send_message(
+            chat_id=int(tg_id),
+            text=customer_message,
+            parse_mode='HTML'
+        )
+        
+        logger.info(f"✅ Mijozga qabul xabari yuborildi: {tg_id}, vaqt: {prep_time}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Mijozga xabar yuborishda xato: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Barcha callback query larni qayta ishlash.
+    Bu yerda tugma bosilganlarida bajariladigan amallar mavjud.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    
+    # Har doim callback query ga javob qaytarish (telegram talabi)
     try:
         await query.answer()
     except Exception as e:
         logger.error(f"Query answer xatosi: {e}")
     
     data = query.data
-    user = update.effective_user
+    logger.info(f"👆 Callback query: {data} from admin: {user.id}")
     
-    logger.info(f"👆 Callback query: {data} from user: {user.id}")
+    # === TAYYORLANISH VAQTI KUTILMOQDA (Bekor qilish) ===
+    if data.startswith("cancel_accept_"):
+        order_id = data.replace("cancel_accept_", "")
+        
+        # State ni tekshirish
+        if (context.user_data.get('awaiting_prep_time') and 
+            context.user_data.get('accepting_order_id') == order_id):
+            
+            context.user_data.pop('awaiting_prep_time', None)
+            context.user_data.pop('accepting_order_id', None)
+            
+            await query.edit_message_text(
+                "❌ <b>Qabul qilish bekor qilindi</b>\n\n"
+                "Yangi buyurtmalarni ko'rish uchun /start ni bosing.",
+                parse_mode='HTML'
+            )
+            return
     
-    # Admin statistika
+    # === STATISTIKA ===
     if data == "admin_stats":
         await show_stats(update, context)
         return
     
-    # Yangi buyurtmalar ro'yxati - ⭐ TO'G'RILANDI
+    # === YANGI BUYURTMALAR RO'YXATI ===
     if data == "show_new_orders":
-        try:
-            await show_new_orders_list(update, context)
-        except Exception as e:
-            logger.error(f"❌ show_new_orders xatosi: {e}")
-            await query.edit_message_text("❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+        await show_new_orders_list(update, context)
         return
     
-    # ⭐⭐⭐ PAYME GURUHIGA O'TISH
+    # === PAYME GURUHIGA O'TISH ===
     if data.startswith("open_payme_group_"):
         order_id = data.replace("open_payme_group_", "")
+        order = get_order(order_id)
         
-        # Guruhga o'tish linkini yaratish
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
         payme_group_username = os.getenv("PAYME_GROUP_USERNAME", "bodrumbota")
         group_link = f"https://t.me/{payme_group_username}"
         
-        # Inline keyboard
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
             [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
@@ -1128,17 +1278,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"💳 <b>To'lovni tekshirish</b>\n\n"
-            f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
             f"Quyidagi ORDER ID ni Payme guruhida qidiring:\n"
             f"<code>{order_id}</code>\n\n"
-            f"To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.\n\n"
-            f"⚠️ To'lov topilmasa, buyurtma bekor qilinadi.",
+            f"To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.",
             reply_markup=keyboard,
             parse_mode='HTML'
         )
         return
     
-    # ⭐⭐⭐ ORQAGA QAYTISH - BUYURTMANI QAYTA KO'RSATISH
+    # === ORQAGA QAYTISH ===
     if data.startswith("back_to_order_"):
         order_id = data.replace("back_to_order_", "")
         order = get_order(order_id)
@@ -1153,39 +1303,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items = json.loads(items)
         
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        phone_display = format_phone_display(order.get('phone', ''))
         
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-        
-        location = order.get('location')
         location_text = ""
+        location = order.get('location')
         if location and ',' in str(location):
             try:
                 lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
                 location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
             except:
                 pass
         
         status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
         
-        message = f"""{status_text}
-
-🆔 Buyurtma: #{order_id[-6:]}
-👤 Mijoz: {order.get('name')}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
-
-        # ⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
+        message = (
+            f"{status_text}\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+            f"👤 Mijoz: {order.get('name')}\n"
+            f"📞 Telefon: {phone_display}\n"
+            f"💵 Summa: {format_price(order.get('total', 0))} so'm"
+            f"{location_text}\n\n"
+            f"🍽 Mahsulotlar:\n{items_text}\n\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order_id}"),
@@ -1196,110 +1337,134 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
         
+        await query.edit_message_text(message, reply_markup=keyboard, parse_mode='HTML')
+        return
+    
+    # === BUYURTMANI QABUL QILISH (Vaqt so'rash) ===
+    if data.startswith("accept_"):
+        order_id = data.replace("accept_", "")
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        # Allaqachon qabul qilinganmi?
+        if order.get('status') == 'accepted':
+            await query.answer("⚠️ Bu buyurtma allaqachon qabul qilingan!", show_alert=True)
+            return
+        
+        # State saqlash
+        context.user_data['awaiting_prep_time'] = True
+        context.user_data['accepting_order_id'] = order_id
+        
+        # Vaqt kiritish uchun so'rov
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_accept_{order_id}")]
+        ])
+        
+        prompt_message = (
+            f"⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+            f"👤 Mijoz: {order.get('name')}\n"
+            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
+            f"🍽 Mahsulotlar:\n{items_text}\n\n"
+            f"✍️ <b>Tayyorlanish vaqtini kiriting:</b>\n"
+            f"<i>Masalan:</i> <code>20 daqiqa</code>, <code>30-40 daqiqa</code>, <code>1 soat</code>"
+        )
+        
         await query.edit_message_text(
-            message,
+            prompt_message,
             reply_markup=keyboard,
             parse_mode='HTML'
         )
         return
     
-    # ⭐⭐⭐ BUYURTMANI QABUL QILISH / BEKOR QILISH / TASDIQLASH
-    if data.startswith(("accept_", "reject_", "confirm_")):
+    # === BUYURTMANI BEKOR QILISH ===
+    if data.startswith("reject_"):
         action, order_id = data.split("_", 1)
         order = get_order(order_id)
         
         if not order:
-            try:
-                await query.edit_message_text("❌ Buyurtma topilmadi!")
-            except Exception as e:
-                logger.warning(f"Message edit error: {e}")
-                await context.bot.send_message(chat_id=user.id, text="❌ Buyurtma topilmadi!")
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
             return
         
-        # ⭐⭐⭐ STATUS NI ANIQ BELGILASH (TUZATILGAN)
-        # Dictionary orqali xarita (map) qilish - xatolikdan saqlanish uchun
-        status_map = {
-            'accept': 'accepted',
-            'reject': 'rejected',
-            'confirm': 'confirmed'
-        }
+        # Status ni rejected ga o'zgartirish
+        updated = update_order_status(order_id, 'rejected', rejected_at=datetime.utcnow())
         
-        new_status = status_map.get(action)
-        
-        # Agar noma'lum action bo'lsa (xavfsizlik uchun)
-        if not new_status:
-            logger.error(f"❌ Noma'lum action: {action}")
-            await query.edit_message_text("❌ Noma'lum amal!")
-            return
-        
-        # Statusni yangilash
-        updated_order = update_order_status(order_id, new_status)
-        
-        if updated_order:
-            # Statusga mos xabar matni
-            status_emojis = {
-                'accepted': '✅ <b>QABUL QILINDI</b>',
-                'rejected': '❌ <b>BEKOR QILINDI</b>',
-                'confirmed': '✅✅ <b>TASDIQLANDI</b>'
-            }
-            status_text = status_emojis.get(new_status, '❓ <b>Noma\'lum</b>')
+        if updated:
+            # Admin ga tasdiq
+            await query.edit_message_text(
+                f"❌ <b>BUYURTMA BEKOR QILINDI</b>\n\n"
+                f"🆔 #{order_id[-6:]}\n"
+                f"👤 {order.get('name')}\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode='HTML'
+            )
             
-            items = order.get('items', [])
-            if isinstance(items, str):
-                items = json.loads(items)
-            
-            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-            
-            raw_phone = order.get('phone', '')
-            phone_display = format_phone_display(raw_phone)
-            
-            message = f"""{status_text}
-
-🆔 Buyurtma: #{order_id[-6:]}
-👤 Mijoz: {order.get('name')}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}"""
-            
-            try:
-                await query.edit_message_text(message, parse_mode='HTML')
-            except Exception as e:
-                logger.warning(f"Message edit error: {e}")
-                await context.bot.send_message(chat_id=user.id, text=message, parse_mode='HTML')
-            
-            # ⭐⭐⭐ MIJOZGA XABAR YUBORISH (TO'LIQ TEKSHIRUV BILAN)
+            # Mijoz ga xabar
             tg_id = order.get('tg_id')
-            logger.info(f"📨 Mijozga xabar yuborish: tg_id={tg_id}, status={new_status}")
-            
             if tg_id and str(tg_id) not in ['0', 'None', '', 'null']:
                 try:
-                    if new_status == 'accepted':
-                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
-                    elif new_status == 'confirmed':
-                        msg = f"✅✅ Buyurtmangiz #{order_id[-6:]} tasdiqlandi!\n\nBuyurtmangiz tayyorlanmoqda! 👨‍🍳"
-                    elif new_status == 'rejected':
-                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
-                    else:
-                        msg = f"ℹ️ Buyurtmangiz #{order_id[-6:]} statusi yangilandi."
-                    
-                    await context.bot.send_message(chat_id=int(tg_id), text=msg, parse_mode='HTML')
-                    logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
+                    await context.bot.send_message(
+                        chat_id=int(tg_id),
+                        text=(
+                            f"❌ <b>Buyurtmangiz bekor qilindi</b>\n\n"
+                            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                            f"📞 Qo'llab-quvvatlash: +998901234567"
+                        ),
+                        parse_mode='HTML'
+                    )
                 except Exception as e:
-                    logger.error(f"❌ Mijozga xabar yuborishda xato: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                logger.warning(f"⚠️ Mijoz tg_id yo'q yoki noto'g'ri: {tg_id}")
+                    logger.error(f"Mijozga bekor xabari yuborishda xato: {e}")
         else:
-            try:
-                await query.edit_message_text("❌ Xatolik yuz berdi! Ma'lumotlar bazasida yangilanmadi.")
-            except Exception as e:
-                logger.warning(f"Message edit error: {e}")
-                await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
+            await query.edit_message_text("❌ Xatolik yuz berdi!")
+        
+        return
+    
+    # === BUYURTMANI TASDIQLASH (Confirm) ===
+    if data.startswith("confirm_"):
+        action, order_id = data.split("_", 1)
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        updated = update_order_status(order_id, 'confirmed', confirmed_at=datetime.utcnow())
+        
+        if updated:
+            await query.edit_message_text(
+                f"✅✅ <b>BUYURTMA TASDIQLANDI</b>\n\n"
+                f"🆔 #{order_id[-6:]}\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode='HTML'
+            )
+            
+            # Mijoz ga xabar
+            tg_id = order.get('tg_id')
+            if tg_id and str(tg_id) not in ['0', 'None', '', 'null']:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(tg_id),
+                        text=(
+                            f"✅✅ <b>Buyurtmangiz tayyor!</b>\n\n"
+                            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                            f"🚚 Tez orada yetkazib beramiz!"
+                        ),
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Mijozga tasdiq xabari yuborishda xato: {e}")
+        else:
+            await query.edit_message_text("❌ Xatolik yuz berdi!")
+        
+        return
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Statistika ko'rsatish"""
@@ -1791,15 +1956,22 @@ async def init_webhook(app):
     # 1. COMMAND HANDLERS (avval)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))    
-    # 2. MESSAGE HANDLERS (Contact va boshqa xabarlar)
+    
+    # 2. MESSAGE HANDLERS
+    # Contact handler
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # 3. ⭐⭐⭐ CALLBACK QUERY HANDLER (MessageHandler DAN KEYIN!)
-    # Bu tartib MUHIM! MessageHandler CallbackQueryHandler dan oldin bo'lsa,
-    # callback query lar to'g'ri ishlamaydi
+    # ⭐⭐⭐ TAYYORLANISH VAQTI HANDLER (Matn xabarlar uchun)
+    # Bu handler faqat admin uchun va specific state da ishlaydi
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.User(user_id=ADMIN_CHAT_ID_INT) & ~filters.COMMAND,
+        prep_time_handler
+    ))
+    
+    # 3. CALLBACK QUERY HANDLER (oxirida)
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     # ==========================================
