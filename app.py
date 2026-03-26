@@ -54,32 +54,100 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 # ⭐ MUHIM: Payme cheklar keladigan guruh ID si
 PAYME_RECEIPTS_GROUP_ID = os.getenv("PAYME_RECEIPTS_GROUP_ID", "")
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start handler"""
+    user = update.effective_user
+    
+    # ⭐ DEBUG: Kim start bosayotganini ko'rish
+    logger.info(f"🚀 /start - User ID: {user.id}, Admin ID: {ADMIN_CHAT_ID_INT}")
+    
+    is_admin = (user.id == ADMIN_CHAT_ID_INT)
+    
+    if is_admin:
+        keyboard = [
+            [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
+            [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
+            [InlineKeyboardButton("🍽️ Menyu ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
+        ]
+        
+        welcome_text = (
+            f"👋 <b>Salom, Admin {user.first_name}!</b>\n\n"
+            f"🤖 <b>BODRUM</b> admin paneliga xush kelibsiz!\n\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        return
+    
+    # Oddiy foydalanuvchi
+    profile = get_user_profile(user.id)
+    
+    if profile and profile.get('phone'):
+        name = profile.get('name', 'Foydalanuvchi')
+        phone = profile.get('phone', '')
+        
+        # Telefon formatini chiroyli qilish
+        formatted_phone = phone
+        if len(phone) == 9:
+            formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ]
+        
+        await update.message.reply_text(
+            f"👋 Salom, <b>{name}</b>!\n\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+            f"📞 Telefon: +998 {formatted_phone}\n\n"
+            f"🛒 Menyudan buyurtma berishingiz mumkin:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    else:
+        # Ro'yxatdan o'tmagan foydalanuvchi
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        
+        await update.message.reply_text(
+            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+            f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+
 # ⭐ YANGI: Guruh ID sini to'g'ri parse qilish
 def parse_chat_id(chat_id_str):
-    """Guruh ID sini to'g'ri formatga o'tkazish"""
+    """Guruh yoki user ID sini to'g'ri formatga o'tkazish"""
     if not chat_id_str:
         return 0
     try:
-        # -1001234567890 formatida bo'lishi kerak
+        # Faqat raqamlarni olish
         chat_id = str(chat_id_str).strip()
-        # Agar -100 bilan boshlanmasa, qo'shish
+        # Agar -100 bilan boshlansa (guruh) yoki - bilan boshlansa
         if chat_id.startswith('-100'):
             return int(chat_id)
         elif chat_id.startswith('-'):
-            # -1234567890 -> -1001234567890
-            return int(f"-100{chat_id[1:]}")
+            return int(chat_id)
         else:
-            # 1234567890 -> -1001234567890
-            return int(f"-100{chat_id}")
+            return int(chat_id)
     except Exception as e:
-        logger.error(f"❌ Chat ID parse xatosi: {e}, value: {chat_id_str}")
+        logger.error(f"Chat ID parse xatosi: {e}")
         return 0
 
 try:
-    ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
+    ADMIN_CHAT_ID_INT = parse_chat_id(ADMIN_CHAT_ID)
     PAYME_GROUP_ID_INT = parse_chat_id(PAYME_RECEIPTS_GROUP_ID)
 except ValueError as e:
-    logger.error(f"❌ Chat ID parse xatosi: {e}")
+    logger.error(f"Chat ID parse xatosi: {e}")
     ADMIN_CHAT_ID_INT = 0
     PAYME_GROUP_ID_INT = 0
 
@@ -845,72 +913,6 @@ async def options_handler(request):
 # ==========================================
 # TELEGRAM BOT FUNCTIONS
 # ==========================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start handler"""
-    user = update.effective_user
-    is_admin = user.id == ADMIN_CHAT_ID_INT
-    
-    logger.info(f"🚀 /start - User: {user.id}, Admin: {is_admin}")
-    
-    if is_admin:
-        keyboard = [
-            [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
-            [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
-            [InlineKeyboardButton("🍽️ Menyu ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
-        ]
-        
-        welcome_text = f"""👋 <b>Salom, Admin {user.first_name}!</b>
-
-🤖 <b>BODRUM</b> admin paneliga xush kelibsiz!
-
-⏰ {datetime.now().strftime('%H:%M:%S')}"""
-        
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        return
-    
-    # Oddiy foydalanuvchi
-    profile = get_user_profile(user.id)
-    
-    if profile and profile.get('phone'):
-        name = profile.get('name', 'Foydalanuvchi')
-        phone = profile.get('phone', '')
-        
-        formatted_phone = phone
-        if len(phone) == 9:
-            formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
-        
-        keyboard = [
-            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
-        ]
-        
-        await update.message.reply_text(
-            f"👋 Salom, <b>{name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📞 Telefon: +998 {formatted_phone}\n\n"
-            f"🛒 Menyudan buyurtma berishingiz mumkin:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-    else:
-        keyboard = ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-        
-        await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
 
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Contact qabul qilish"""
@@ -1953,43 +1955,36 @@ async def init_webhook(app):
         logger.error("❌ TOKEN o'rnatilmagan!")
         return
     
-    # Database ni initsializatsiya qilish
     if not init_database():
         logger.error("❌ Database initialization failed!")
         return
-    
-    webhook_url = os.getenv("WEBHOOK_URL", "")
-    if not webhook_url:
-        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-        if railway_domain:
-            webhook_url = f"https://{railway_domain}"
     
     # Bot application yaratish
     application = Application.builder().token(TOKEN).build()
     
     # ==========================================
-    # HANDLERLAR TARTIBI - MUHIM!
+    # HANDLERLAR
     # ==========================================
     
-    # 1. COMMAND HANDLERS (avval)
+    # 1. COMMAND HANDLERS - eng muhimi bu yerda
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))    
     
     # 2. MESSAGE HANDLERS
-    # Contact handler
+    # Contact (telefon ulashish)
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # ⭐⭐⭐ TAYYORLANISH VAQTI HANDLER (Matn xabarlar uchun)
-    # Bu handler faqat admin uchun va specific state da ishlaydi
+    # ⭐ TAYYORLANISH VAQTI - faqat admin va specific state uchun
+    # Bu handler callback dan KEYIN keladi, chunki callback query emas, matn xabar
     application.add_handler(MessageHandler(
         filters.TEXT & filters.User(user_id=ADMIN_CHAT_ID_INT) & ~filters.COMMAND,
         prep_time_handler
     ))
     
-    # 3. CALLBACK QUERY HANDLER (oxirida)
+    # 3. CALLBACK QUERY HANDLER - oxirida
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     # ==========================================
@@ -1999,26 +1994,20 @@ async def init_webhook(app):
     await application.initialize()
     await application.start()
     
-    # ==========================================
-    # WEBHOOK O'RNATISH
-    # ==========================================
-    
+    # Webhook o'rnatish
+    webhook_url = os.getenv("WEBHOOK_URL", "")
     if webhook_url:
         full_webhook_url = f"{webhook_url}/webhook"
         try:
-            # ⭐ MUHIM: Callback query updates ni olish uchun allowed_updates
             await application.bot.set_webhook(
                 url=full_webhook_url,
                 allowed_updates=['message', 'callback_query', 'inline_query', 'edited_message']
             )
             logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
-            logger.info(f"✅ Allowed updates: message, callback_query, inline_query, edited_message")
         except Exception as e:
             logger.error(f"❌ Webhook xato: {e}")
     
-    logger.info(f"🤖 Bot ishga tushdi!")
-    logger.info(f"⚡ Admin tugmalari: Qabul, Bekor, To'lovni tekshirish")
-    logger.info(f"📦 Yangi buyurtmalar tugmasi ishga tushdi")
+    logger.info(f"🤖 Bot ishga tushdi! Admin ID: {ADMIN_CHAT_ID_INT}")
 
 async def shutdown(app):
     global application
