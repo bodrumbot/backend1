@@ -1,8 +1,3 @@
-# ==========================================
-# BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
-# To'g'rilangan versiya - Guruh handleri fixparse_payme_receipt
-# ==========================================
-
 import os
 import logging
 import asyncio
@@ -93,6 +88,9 @@ application = None
 # DATABASE FUNCTIONS
 # ==========================================
 
+# init_database() funksiyasida orders jadvalini yangilash
+# init_database() funksiyasiga qo'shing (app.py dagi)
+
 def init_database():
     """Jadval va column'larni avtomatik yaratish/yangilash"""
     conn = None
@@ -100,7 +98,7 @@ def init_database():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Orders jadvali
+        # Orders jadvali - tg_id BIGINT ga o'zgartirish
         cur.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -113,7 +111,7 @@ def init_database():
                 payment_status VARCHAR(50) DEFAULT 'pending',
                 payment_method VARCHAR(50) DEFAULT 'payme',
                 location VARCHAR(255),
-                tg_id BIGINT,
+                tg_id BIGINT,  -- INTEGER o'rniga BIGINT
                 notified BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 accepted_at TIMESTAMP,
@@ -130,39 +128,28 @@ def init_database():
             )
         """)
         
-        # YANGI USTUNLARNI TEKSHIRISH VA QO'SHISH
-        columns_to_check = [
-            ('initiated_from', 'VARCHAR(50) DEFAULT \'website\''),
-            ('source', 'VARCHAR(50) DEFAULT \'website\''),
-            ('auto_accepted', 'BOOLEAN DEFAULT FALSE'),
-            ('transaction_id', 'VARCHAR(100)'),
-            ('paid_at', 'TIMESTAMP'),
-            ('confirmed_at', 'TIMESTAMP'),
-            ('accepted_at', 'TIMESTAMP'),
-            ('rejected_at', 'TIMESTAMP'),
-            ('payme_receipt_id', 'VARCHAR(100)'),
-            ('payme_card_mask', 'VARCHAR(50)'),
-            ('admin_note', 'TEXT')
-        ]
+        # ⭐⭐⭐ YANGI: Mavjud tg_id ustunini BIGINT ga o'zgartirish
+        cur.execute("""
+            DO $$
+            BEGIN
+                -- Agar tg_id INTEGER bo'lsa, BIGINT ga o'zgartirish
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'orders' 
+                    AND column_name = 'tg_id'
+                    AND data_type = 'integer'
+                ) THEN
+                    ALTER TABLE orders ALTER COLUMN tg_id TYPE BIGINT;
+                    RAISE NOTICE 'tg_id INTEGER -> BIGINT o''zgartirildi';
+                END IF;
+            END $$;
+        """)
         
-        for col_name, col_type in columns_to_check:
-            cur.execute(f"""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'orders' AND column_name = '{col_name}'
-            """)
-            if not cur.fetchone():
-                cur.execute(f"""
-                    ALTER TABLE orders 
-                    ADD COLUMN {col_name} {col_type}
-                """)
-                logger.info(f"✅ '{col_name}' ustuni qo'shildi")
-        
-        # Users jadvali
+        # Users jadvali - tg_id BIGINT
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
-                tg_id BIGINT UNIQUE NOT NULL,
+                tg_id BIGINT UNIQUE NOT NULL,  -- INTEGER o'rniga BIGINT
                 name VARCHAR(255),
                 phone VARCHAR(20),
                 username VARCHAR(100),
@@ -171,27 +158,34 @@ def init_database():
             )
         """)
         
-        # Index'lar
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_status ON orders(payment_status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_transaction_id ON orders(transaction_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id)")
+        # ⭐⭐⭐ YANGI: Mavjud users.tg_id ni ham BIGINT ga o'zgartirish
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' 
+                    AND column_name = 'tg_id'
+                    AND data_type = 'integer'
+                ) THEN
+                    ALTER TABLE users ALTER COLUMN tg_id TYPE BIGINT;
+                    RAISE NOTICE 'users.tg_id INTEGER -> BIGINT o''zgartirildi';
+                END IF;
+            END $$;
+        """)
         
         conn.commit()
         cur.close()
-        logger.info("✅ Database initialized successfully")
+        logger.info("✅ Database initialized successfully with BIGINT tg_id")
         return True
         
     except Exception as e:
         logger.error(f"❌ Database init error: {e}")
-        import traceback
-        traceback.print_exc()
         return False
     finally:
         if conn:
             conn.close()
+
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -609,6 +603,11 @@ def format_phone_display(phone: str) -> str:
     return f"+998{phone}"
 
 
+# ✅ To'g'rilangan versiya (app.py)
+# create_order funksiyasida (app.py)
+
+# create_order funksiyasida (app.py)
+
 def create_order(data: Dict) -> Optional[Dict]:
     """Yangi buyurtma yaratish - tg_id to'g'ri saqlanadi"""
     conn = None
@@ -622,20 +621,25 @@ def create_order(data: Dict) -> Optional[Dict]:
         else:
             items_json = items
 
-        # ⭐ MUHIM: tg_id ni to'g'ri olish
-        tg_id = data.get('tgId') or data.get('tg_id') or data.get('user_id')
-
-        # tg_id ni integer ga o'tkazish
-        if tg_id:
+        # ⭐ MUHIM: tg_id ni to'g'ri olish (bir nechta nomlar bilan)
+        tg_id_raw = data.get('tgId') or data.get('tg_id') or data.get('user_id')
+        
+        tg_id = None
+        if tg_id_raw:
             try:
-                tg_id = int(tg_id)
-                logger.info(f"✅ tg_id saqlanmoqda: {tg_id}")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"⚠️ tg_id conversion xatosi: {e}, value: {tg_id}")
+                # BIGINT uchun max katta son: 9223372036854775807
+                tg_id = int(tg_id_raw)
+                if tg_id > 9223372036854775807 or tg_id < -9223372036854775808:
+                    logger.warning(f"⚠️ tg_id juda katta: {tg_id}")
+                    tg_id = None
+                else:
+                    logger.info(f"✅ tg_id saqlanmoqda: {tg_id} (type: {type(tg_id).__name__})")
+            except (ValueError, TypeError, OverflowError) as e:
+                logger.warning(f"⚠️ tg_id conversion xatosi: {e}, value: {tg_id_raw}")
                 tg_id = None
-        else:
-            logger.warning("⚠️ tg_id berilmagan!")
-            tg_id = None
+        
+        if not tg_id:
+            logger.warning("⚠️ tg_id berilmagan yoki noto'g'ri!")
 
         source = data.get('source', 'website')
         initiated_from = data.get('initiated_from', 'website')
@@ -663,14 +667,9 @@ def create_order(data: Dict) -> Optional[Dict]:
 
         if result:
             order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-
             # ⭐ Tekshirish: tg_id saqlandi mi?
             saved_tg_id = order_dict.get('tg_id')
             logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}, tg_id: {saved_tg_id}")
-
             return order_dict
         return None
 
@@ -693,19 +692,20 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         cur = conn.cursor()
 
         # Avval buyurtmani olish (tg_id ni saqlab qolish uchun)
-        cur.execute("SELECT tg_id FROM orders WHERE order_id = %s", (order_id,))
+        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
         existing = cur.fetchone()
 
         if not existing:
             logger.warning(f"⚠️ update_order_status: Buyurtma topilmadi: {order_id}")
             return None
 
-        existing_tg_id = existing.get('tg_id')
+        existing_dict = dict(existing)
+        existing_tg_id = existing_dict.get('tg_id')
         logger.info(f"📊 Mavjud tg_id: {existing_tg_id}")
 
         update_data = {'status': status}
 
-        # TIMESTAMP FIELDLAR - BARCHA STATUSLAR UCHUN
+        # TIMESTAMP FIELDLAR
         timestamp_fields = {
             'accepted': 'accepted_at',
             'rejected': 'rejected_at', 
@@ -714,44 +714,22 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             'pending': None
         }
 
-        # Statusga mos timestamp ni qo'shish
         if status in timestamp_fields and timestamp_fields[status]:
             field_name = timestamp_fields[status]
-            cur.execute(f"""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'orders' AND column_name = '{field_name}'
-            """)
-            if cur.fetchone():
-                update_data[field_name] = datetime.utcnow().isoformat()
+            update_data[field_name] = datetime.utcnow()
 
-        # Agar confirmed bo'lsa va avval accepted bo'lmasa, accepted_at ham qo'shish
         if status == 'confirmed':
-            cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'orders' AND column_name = 'accepted_at'
-            """)
-            if cur.fetchone():
-                update_data['accepted_at'] = datetime.utcnow().isoformat()
+            update_data['accepted_at'] = datetime.utcnow()
 
-        # paid_at alohida
         if kwargs.get('paid_at'):
-            cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'orders' AND column_name = 'paid_at'
-            """)
-            if cur.fetchone():
-                update_data['paid_at'] = kwargs.get('paid_at')
+            update_data['paid_at'] = kwargs.get('paid_at')
 
-        # notified parametri
         if 'notified' in kwargs:
             update_data['notified'] = kwargs['notified']
 
-        # Qolgan fieldlar (admin_note va boshqa)
+        # Boshqa parametrlarni qo'shish (tg_id ni update qilmaslik uchun tekshiramiz)
         for key, val in kwargs.items():
-            if val is not None and key not in ['paid_at', 'notified', 'accepted_at', 'confirmed_at', 'rejected_at']:
+            if val is not None and key not in ['paid_at', 'notified', 'accepted_at', 'confirmed_at', 'rejected_at', 'tg_id']:
                 update_data[key] = val
 
         # SQL query yaratish
@@ -770,16 +748,17 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 
         if result:
             order_dict = dict(result)
-
-            # ⭐ tg_id ni saqlab qolish (agar yangilangan order da yo'q bo'lsa)
+            # ⭐ MUHIM: Agar yangilangan order da tg_id yo'q bo'lsa, avvalgidan qayta tiklash
             if not order_dict.get('tg_id') and existing_tg_id:
                 order_dict['tg_id'] = existing_tg_id
+                # Database ni ham yangilash
+                conn2 = get_db_connection()
+                cur2 = conn2.cursor()
+                cur2.execute("UPDATE orders SET tg_id = %s WHERE order_id = %s", (existing_tg_id, order_id))
+                conn2.commit()
+                cur2.close()
+                conn2.close()
                 logger.info(f"🔄 tg_id qayta tiklandi: {existing_tg_id}")
-
-            # Timestamp larni formatlash
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
 
             logger.info(f"✅ Buyurtma yangilandi: {order_id}, status: {status}, tg_id: {order_dict.get('tg_id')}")
             return order_dict
@@ -1135,7 +1114,6 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
 async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin tayyorlanish vaqtini kiritganda ishga tushadi.
-    Bu funksiya faqat admin tomonidan buyurtma qabul qilish jarayonida vaqt kiritilganda chaqiriladi.
     """
     user = update.effective_user
 
@@ -1159,12 +1137,12 @@ async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Buyurtma ma'lumotlarini olish
     order = get_order(order_id)
     if not order:
-        await update.message.reply_text("❌ Xatolik: Buyurtma ma'lumotlar bazasidan topilmadi!")
+        await update.message.reply_text("❌ Xatolik: Buyurtma topilmadi!")
         context.user_data.pop('awaiting_prep_time', None)
         context.user_data.pop('accepting_order_id', None)
         return
 
-    # Buyurtma allaqachon qabul qilinganmi tekshirish
+    # Allaqachon qabul qilinganmi tekshirish
     if order.get('status') == 'accepted':
         await update.message.reply_text("⚠️ Bu buyurtma allaqachon qabul qilingan!")
         context.user_data.pop('awaiting_prep_time', None)
@@ -1172,7 +1150,11 @@ async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Buyurtma statusini yangilash (accepted + tayyorlanish vaqti)
+        # ⭐ MUHIM: Avvalgi tg_id ni saqlab qolish
+        existing_tg_id = order.get('tg_id')
+        logger.info(f"📋 prep_time_handler: Mavjud tg_id = {existing_tg_id}")
+
+        # Buyurtma statusini yangilash
         updated_order = update_order_status(
             order_id, 
             'accepted',
@@ -1181,39 +1163,35 @@ async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if updated_order:
-            # ⭐ MUHIM: Yangilangan order dan tg_id ni olish
-            # update_order_status qaytargan order da tg_id bo'lishi kerak
-            # Agar yo'q bo'lsa, avvalgi order dan olamiz
-            if not updated_order.get('tg_id') and order.get('tg_id'):
-                updated_order['tg_id'] = order.get('tg_id')
+            # ⭐ MUHIM: Yangilangan order dan tg_id ni olish yoki avvalgidan tiklash
+            final_tg_id = updated_order.get('tg_id') or existing_tg_id
+            updated_order['tg_id'] = final_tg_id
+            
+            logger.info(f"📋 Final tg_id: {final_tg_id}")
 
-            # Mijoz ismini olish (backslash muammosini oldini olish uchun)
-            customer_name = order.get('name') or "Mijoz"
-
-            # Admin ga tasdiqlash xabarini yuborish
+            # Admin ga tasdiqlash
             admin_confirm_msg = (
                 "✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
                 f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                f"👤 Mijoz: {customer_name}\n"
+                f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
                 f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
                 f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-                "📨 Mijozga xabar yuborildi!"
+                f"📱 tg_id: {final_tg_id}\n"
+                "📨 Mijozga xabar yuborilmoqda..."
             )
-
             await update.message.reply_text(admin_confirm_msg, parse_mode='HTML')
 
-            # ⭐⭐⭐ MIJOZGA XABAR YUBORISH (to'g'rilangan)
-            # context.bot ni to'g'ridan-to'g'ri yuboramiz
+            # ⭐⭐⭐ MIJOZGA XABAR YUBORISH
             notification_sent = await notify_customer_accepted(context.bot, updated_order, prep_time)
 
-            if not notification_sent:
-                # Agar xabar yuborilmasa, qo'shimcha xabar
+            if notification_sent:
+                await update.message.reply_text("✅ Mijozga xabar yuborildi!")
+            else:
                 await update.message.reply_text(
                     "⚠️ <b>Diqqat!</b>\n"
                     "Mijozga xabar yuborilmadi. Iltimos, qo'lda xabar yuboring.",
                     parse_mode='HTML'
                 )
-
         else:
             await update.message.reply_text(
                 "❌ <b>Xatolik!</b>\nBuyurtma ma'lumotlar bazasida yangilanmadi.",
@@ -1239,9 +1217,17 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
     Buyurtma qabul qilinganda mijozga xabar yuboradi.
     Tayyorlanish vaqti bilan birga yuboriladi.
     """
-    tg_id = order.get('tg_id')
+    # ⭐ MUHIM: Bir nechta yo'l bilan tg_id ni olish
+    tg_id = order.get('tg_id') or order.get('tgId') or order.get('user_id')
     
-    if not tg_id or str(tg_id) in ['0', 'None', '', 'null']:
+    # String bo'lsa, int ga o'tkazish
+    if tg_id and isinstance(tg_id, str):
+        try:
+            tg_id = int(tg_id)
+        except ValueError:
+            tg_id = None
+    
+    if not tg_id or tg_id == 0:
         logger.warning(f"⚠️ Mijoz tg_id yo'q: {order.get('order_id')}")
         return False
     
@@ -1251,7 +1237,6 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
         if isinstance(items, str):
             items = json.loads(items)
         
-        # Mahsulotlarni qisqa ro'yxatga olish
         if items:
             items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]])
             if len(items) > 3:
@@ -1259,7 +1244,6 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
         else:
             items_short = "Ma'lumot yo'q"
         
-        # Vaqt formatini olish
         current_time = datetime.now().strftime('%H:%M')
         order_id_short = str(order.get('order_id', 'N/A'))[-6:]
         total_price = format_price(order.get('total', 0))
