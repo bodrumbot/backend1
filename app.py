@@ -141,7 +141,8 @@ def init_database():
             ('accepted_at', 'TIMESTAMP'),
             ('rejected_at', 'TIMESTAMP'),
             ('payme_receipt_id', 'VARCHAR(100)'),
-            ('payme_card_mask', 'VARCHAR(50)')
+            ('payme_card_mask', 'VARCHAR(50)'),
+            ('admin_note', 'TEXT')
         ]
         
         for col_name, col_type in columns_to_check:
@@ -271,7 +272,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
             parse_mode='HTML'
         )
-        
+
 # ==========================================
 # TELEGRAM BOT API DIRECT FUNCTIONS
 # ==========================================
@@ -614,7 +615,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # ⭐ CASE INSENSITIVE qidirish - ILIKE ishlatamiz
+        # CASE INSENSITIVE qidirish - ILIKE ishlatamiz
         cur.execute(
             "SELECT * FROM orders WHERE order_id ILIKE %s", 
             (order_id,)
@@ -707,12 +708,12 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         update_data = {'status': status}
         
-        # ⭐⭐⭐ TIMESTAMP FIELDLAR - BARCHA STATUSLAR UCHUN
+        # TIMESTAMP FIELDLAR - BARCHA STATUSLAR UCHUN
         timestamp_fields = {
             'accepted': 'accepted_at',
             'rejected': 'rejected_at', 
             'confirmed': 'confirmed_at',
-            'pending_payment': None,  # Faqat status o'zgaradi
+            'pending_payment': None,
             'pending': None
         }
         
@@ -735,7 +736,6 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
                 WHERE table_name = 'orders' AND column_name = 'accepted_at'
             """)
             if cur.fetchone():
-                # Avval accepted_at bo'lmasa, hozir qo'shish
                 update_data['accepted_at'] = datetime.utcnow().isoformat()
         
         # paid_at alohida
@@ -752,11 +752,12 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if 'notified' in kwargs:
             update_data['notified'] = kwargs['notified']
         
-        # Qolgan fieldlar
+        # Qolgan fieldlar (admin_note va boshqa)
         for key, val in kwargs.items():
             if val is not None and key not in ['paid_at', 'notified', 'accepted_at', 'confirmed_at', 'rejected_at']:
                 update_data[key] = val
         
+        # SQL query yaratish
         fields = []
         values = []
         for key, val in update_data.items():
@@ -979,7 +980,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # ⭐⭐⭐ TO'G'RILANDI - Yangi buyurtmalar: pending_payment statusida
+        # Yangi buyurtmalar: pending_payment statusida
         cur.execute("""
             SELECT * FROM orders 
             WHERE status IN ('pending_payment', 'pending')
@@ -1197,7 +1198,7 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
         else:
             items_short = "Ma'lumot yo'q"
         
-        # Vaqt formatini tashqarida olish (f-string ichida emas)
+        # Vaqt formatini olish
         current_time = datetime.now().strftime('%H:%M')
         order_id_short = str(order.get('order_id', 'N/A'))[-6:]
         total_price = format_price(order.get('total', 0))
@@ -1320,7 +1321,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         phone_display = format_phone_display(order.get('phone', ''))
         
-        # State larni oldini olish uchun qiymatlarni olish
         order_id_val = order.get('order_id', 'N/A')
         customer_name = order.get('name', 'Mijoz')
         total_val = order.get('total', 0)
@@ -1498,6 +1498,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await show_stats(update, context)
 
+
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Statistikani ko'rsatish"""
     user = update.effective_user
@@ -1564,9 +1565,6 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.edit_message_text(text)
         else:
             await update.message.reply_text(text)
-
-
-
 
 async def health_handler(request):
     return web.json_response({
@@ -1938,7 +1936,7 @@ async def webhook_handler(request):
     if application:
         try:
             data = await request.json()
-            logger.info(f"📩 Webhook data: {data}")  # ⭐ Log qo'shildi
+            logger.info(f"📩 Webhook data: {data}")
             
             if 'callback_query' in data:
                 logger.info(f"👆 Callback query keldi: {data['callback_query']['data']}")
@@ -1965,7 +1963,7 @@ async def init_webhook(app):
     application = Application.builder().token(TOKEN).build()
     
     # ==========================================
-    # HANDLERLAR
+    # HANDLERLAR - TARTIBI MUHIM!
     # ==========================================
     
     # 1. COMMAND HANDLERS - eng muhimi bu yerda
