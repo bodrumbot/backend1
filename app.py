@@ -607,12 +607,6 @@ def format_phone_display(phone: str) -> str:
     phone = phone[-9:] if len(phone) > 9 else phone
     return f"+998{phone}"
 
-
-# ✅ To'g'rilangan versiya (app.py)
-# create_order funksiyasida (app.py)
-
-# create_order funksiyasida (app.py)
-
 # app.py - create_order funksiyasida TUZATISH
 def create_order(data: Dict) -> Optional[Dict]:
     """Yangi buyurtma yaratish"""
@@ -679,6 +673,10 @@ def create_order(data: Dict) -> Optional[Dict]:
 
         if result:
             order_dict = dict(result)
+            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
             logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}")
             return order_dict
         return None
@@ -1657,19 +1655,36 @@ async def create_order_handler(request):
             # Payme URL ni qaytarish
             payme_url = f"https://checkout.payme.uz/{os.getenv('PAYME_MERCHANT_ID')}?orderId={order['order_id']}&amount={order['total'] * 100}"
             
-            return web.json_response({
-                **order,
-                "message": "Buyurtma yaratildi. To'lovni amalga oshiring.",
-                "payme_url": payme_url
-            }, status=201, headers=get_cors_headers())
+            # ⭐⭐⭐ MUHIM: datetime obyektlarini JSON serializable qilish
+            response_data = {**order}
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
+                    response_data[key] = response_data[key].isoformat()
+            
+            response_data["message"] = "Buyurtma yaratildi. To'lovni amalga oshiring."
+            response_data["payme_url"] = payme_url
+            
+            return web.json_response(
+                response_data,
+                status=201, 
+                headers=get_cors_headers()
+            )
         else:
-            return web.json_response({"error": "Failed to create order"}, status=500, headers=get_cors_headers())
+            return web.json_response(
+                {"error": "Failed to create order"}, 
+                status=500, 
+                headers=get_cors_headers()
+            )
         
     except Exception as e:
         logger.error(f"API create order error: {e}")
         import traceback
         traceback.print_exc()
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        return web.json_response(
+            {"error": str(e)}, 
+            status=500, 
+            headers=get_cors_headers()
+        )
 
 async def notify_admin_new_order(order: Dict):
     """
@@ -1778,18 +1793,45 @@ async def notify_admin_new_order(order: Dict):
         traceback.print_exc()
         return False
 
-async def get_order_handler(request):
+async def update_order_handler(request):
+    """Buyurtma yangilash"""
     try:
         order_id = request.match_info['order_id']
-        order = get_order(order_id)
+        data = await request.json()
         
-        if not order:
-            return web.json_response({"error": "Not found"}, status=404, headers=get_cors_headers())
+        status = data.get('status')
+        payment_status = data.get('paymentStatus')
+        admin_note = data.get('adminNote')
         
-        return web.json_response(order, headers=get_cors_headers())
+        updated = update_order_status(
+            order_id, 
+            status, 
+            payment_status=payment_status,
+            admin_note=admin_note
+        )
+        
+        if updated:
+            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
+            response_data = {**updated}
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
+                    response_data[key] = response_data[key].isoformat()
+            
+            return web.json_response(response_data, headers=get_cors_headers())
+        else:
+            return web.json_response(
+                {"error": "Order not found"}, 
+                status=404, 
+                headers=get_cors_headers()
+            )
+            
     except Exception as e:
-        logger.error(f"API get order error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        logger.error(f"Update order error: {e}")
+        return web.json_response(
+            {"error": str(e)}, 
+            status=500, 
+            headers=get_cors_headers()
+        )
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - BARCHA STATUSLAR"""
@@ -1819,6 +1861,7 @@ async def orders_list_handler(request):
         orders = []
         for row in results:
             order_dict = dict(row)
+            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -1828,7 +1871,11 @@ async def orders_list_handler(request):
         
     except Exception as e:
         logger.error(f"Orders list error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        return web.json_response(
+            {"error": str(e)}, 
+            status=500, 
+            headers=get_cors_headers()
+        )
 
 async def new_orders_handler(request):
     """Yangi buyurtmalarni olish"""
@@ -1847,6 +1894,7 @@ async def new_orders_handler(request):
         orders = []
         for row in results:
             order_dict = dict(row)
+            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -1856,7 +1904,11 @@ async def new_orders_handler(request):
         
     except Exception as e:
         logger.error(f"New orders error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        return web.json_response(
+            {"error": str(e)}, 
+            status=500, 
+            headers=get_cors_headers()
+        )
 
 async def update_order_handler(request):
     """Buyurtma yangilash"""
@@ -1966,6 +2018,19 @@ async def get_user_profile_api(request):
         
         profile = get_user_profile(tg_id)
         orders = get_user_orders(tg_id)
+        
+        # ⭐⭐⭐ MUHIM: orders dagi datetime obyektlarini string ga aylantirish
+        if orders:
+            for order in orders:
+                for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                    if order.get(key) and hasattr(order[key], 'isoformat'):
+                        order[key] = order[key].isoformat()
+        
+        # Profile dagi datetime larni ham aylantirish
+        if profile:
+            for key in ['created_at', 'updated_at']:
+                if profile.get(key) and hasattr(profile[key], 'isoformat'):
+                    profile[key] = profile[key].isoformat()
         
         print(f"✅ API: Profil: {profile is not None}, Buyurtmalar: {len(orders)}")
         
