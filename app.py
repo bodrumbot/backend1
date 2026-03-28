@@ -563,6 +563,8 @@ def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
         if conn:
             conn.close()
 
+
+
 def get_user_orders(tg_id: int) -> List[Dict[str, Any]]:
     """Foydalanuvchining barcha buyurtmalarini olish"""
     conn = None
@@ -782,6 +784,34 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
     finally:
         if conn:
             conn.close()
+
+async def get_order_handler(request):
+    try:
+        order_id = request.match_info['order_id']
+        order = get_order(order_id)
+        
+        if not order:
+            return web.json_response(
+                {"error": "Not found"}, 
+                status=404, 
+                headers=get_cors_headers()
+            )
+        
+        # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
+        response_data = {**order}
+        for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+            if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
+                response_data[key] = response_data[key].isoformat()
+        
+        return web.json_response(response_data, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"API get order error: {e}")
+        return web.json_response(
+            {"error": str(e)}, 
+            status=500, 
+            headers=get_cors_headers()
+        )
 
 async def notify_admin_payment_received(order: Dict, bot=None):
     """
