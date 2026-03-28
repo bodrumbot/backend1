@@ -1,3 +1,8 @@
+# ==========================================
+# BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
+# To'g'rilangan versiya - Guruh handleri fixparse_payme_receipt
+# ==========================================
+
 import os
 import logging
 import asyncio
@@ -608,8 +613,9 @@ def format_phone_display(phone: str) -> str:
 
 # create_order funksiyasida (app.py)
 
+# app.py - create_order funksiyasida TUZATISH
 def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish - tg_id to'g'ri saqlanadi"""
+    """Yangi buyurtma yaratish"""
     conn = None
     try:
         conn = get_db_connection()
@@ -619,46 +625,52 @@ def create_order(data: Dict) -> Optional[Dict]:
         if isinstance(items, list):
             items_json = json.dumps(items)
         else:
-            items_json = items
+            items_json = str(items) if items else '[]'
 
-        # ⭐ MUHIM: tg_id ni to'g'ri olish (bir nechta nomlar bilan)
-        tg_id_raw = data.get('tgId') or data.get('tg_id') or data.get('user_id')
-        
+        # ⭐⭐⭐ TO'G'RILANGAN tg_id olish
         tg_id = None
-        if tg_id_raw:
-            try:
-                # BIGINT uchun max katta son: 9223372036854775807
+        try:
+            # 1. tgId yoki tg_id dan olish
+            tg_id_raw = data.get('tgId') or data.get('tg_id')
+            
+            # 2. Agar string bo'lsa va raqamli bo'lsa
+            if tg_id_raw and str(tg_id_raw).isdigit():
                 tg_id = int(tg_id_raw)
-                if tg_id > 9223372036854775807 or tg_id < -9223372036854775808:
-                    logger.warning(f"⚠️ tg_id juda katta: {tg_id}")
-                    tg_id = None
-                else:
-                    logger.info(f"✅ tg_id saqlanmoqda: {tg_id} (type: {type(tg_id).__name__})")
-            except (ValueError, TypeError, OverflowError) as e:
-                logger.warning(f"⚠️ tg_id conversion xatosi: {e}, value: {tg_id_raw}")
-                tg_id = None
-        
-        if not tg_id:
-            logger.warning("⚠️ tg_id berilmagan yoki noto'g'ri!")
+                logger.info(f"✅ tg_id integer ga o'tkazildi: {tg_id}")
+            elif tg_id_raw:
+                # Agar 'tg_123' formatida bo'lsa
+                clean_id = str(tg_id_raw).replace('tg_', '').replace('user_', '')
+                if clean_id.isdigit():
+                    tg_id = int(clean_id)
+                    
+        except Exception as e:
+            logger.error(f"❌ tg_id conversion xatosi: {e}")
+            tg_id = None
 
+        # NULL uchun to'g'ri SQL
+        order_id = data.get('orderId')
+        name = data.get('name', 'Mijoz')
+        phone = data.get('phone', '000000000')
+        total = data.get('total', 0)
+        location = data.get('location')
         source = data.get('source', 'website')
-        initiated_from = data.get('initiated_from', 'website')
+        
+        logger.info(f"📋 INSERT: order_id={order_id}, tg_id={tg_id} (type: {type(tg_id)})")
 
         cur.execute("""
             INSERT INTO orders (
                 order_id, name, phone, items, total, 
                 status, payment_status, payment_method, 
                 location, tg_id, notified, created_at,
-                initiated_from, source
+                source
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
-            data.get('orderId'), data.get('name'), data.get('phone'),
-            items_json, data.get('total'), data.get('status', 'pending_payment'),
-            data.get('paymentStatus', 'pending'), data.get('paymentMethod', 'payme'),
-            data.get('location'), tg_id, False, datetime.utcnow(),
-            initiated_from, source
+            order_id, name, phone, items_json, total, 
+            'pending_payment', 'pending', 'payme',
+            location, tg_id, False, datetime.utcnow(),
+            source
         ))
 
         result = cur.fetchone()
@@ -667,16 +679,14 @@ def create_order(data: Dict) -> Optional[Dict]:
 
         if result:
             order_dict = dict(result)
-            # ⭐ Tekshirish: tg_id saqlandi mi?
-            saved_tg_id = order_dict.get('tg_id')
-            logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}, tg_id: {saved_tg_id}")
+            logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}")
             return order_dict
         return None
 
     except Exception as e:
-        logger.error(f"Create order error: {e}")
+        logger.error(f"❌ Create order ERROR: {e}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())  # To'liq traceback
         if conn:
             conn.rollback()
         return None
