@@ -1294,7 +1294,7 @@ async def notify_customer_accepted(bot, order: Dict, prep_time: str):
             f"🍽 <b>Buyurtma:</b> {items_short}\n\n"
             "👨‍🍳 Oshxonada tayyorlanmoqda...\n"
             "🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
-            "📞 Savollar bo'yicha: +998901234567\n"
+            "📞 Savollar bo'yicha: +998774445020\n"
             f"⏰ {current_time}"
         )
         
