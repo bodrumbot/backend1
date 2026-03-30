@@ -1,0 +1,18 @@
+{
+  "categories": [
+    {"id": "all", "name": "Все", "icon": "🍽", "sortOrder": 0},
+    {"id": "salad", "name": "Салаты", "icon": "🥗", "sortOrder": 1},
+    {"id": "soup", "name": "Супы", "icon": "🍜", "sortOrder": 2},
+    {"id": "bread", "name": "Хлеб", "icon": "🍞", "sortOrder": 3},
+    {"id": "pide", "name": "Пиде", "icon": "🫓", "sortOrder": 4},
+    {"id": "pizza", "name": "Пицца", "icon": "🍕", "sortOrder": 5},
+    {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔", "sortOrder": 6},
+    {"id": "fish", "name": "Рыба", "icon": "🐟", "sortOrder": 7},
+    {"id": "main", "name": "Основные блюда", "icon": "🍖", "sortOrder": 8},
+    {"id": "side", "name": "Гарниры", "icon": "🍟", "sortOrder": 9},
+    {"id": "dessert", "name": "Десерты", "icon": "🍰", "sortOrder": 10},
+    {"id": "fruit", "name": "Фрукты", "icon": "🍇", "sortOrder": 11},
+    {"id": "drink", "name": "Напитки", "icon": "🥤", "sortOrder": 12}
+  ],
+  "updated_at": "2026-03-30T18:34:00.000000"
+}
