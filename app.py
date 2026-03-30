@@ -6,6 +6,7 @@
 import os
 import logging
 import asyncio
+from flask import app
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
@@ -397,6 +398,7 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
         
 
 
+
 # ==========================================
 # PAYME GURUHIGA O'TISH VA TEKSHIRISH
 # ==========================================
@@ -436,6 +438,108 @@ async def open_payme_group_handler(update: Update, context: ContextTypes.DEFAULT
         reply_markup=keyboard,
         parse_mode='HTML'
     )
+
+async def save_categories_handler(request):
+    """Kategoriyalarni saqlash (faqat admin)"""
+    try:
+        data = await request.json()
+        categories = data.get('categories', [])
+        
+        # JSON faylga saqlash
+        with open('categories.json', 'w', encoding='utf-8') as f:
+            json.dump(categories, f, ensure_ascii=False, indent=2)
+        
+        return web.json_response({
+            "success": True,
+            "message": "Categories saved",
+            "timestamp": datetime.utcnow().isoformat()
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"Save categories error: {e}")
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
+
+async def get_categories_handler(request):
+    """Kategoriyalarni olish - barcha mijozlar uchun"""
+    try:
+        import json
+        import os
+        
+        # categories.json fayl yo'li
+        categories_file = os.path.join(os.path.dirname(__file__), 'categories.json')
+        
+        # Fayldan kategoriyalarni o'qish
+        if os.path.exists(categories_file):
+            with open(categories_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Agar JSON da "categories" kaliti bo'lsa
+                if isinstance(data, dict) and 'categories' in data:
+                    categories = data['categories']
+                else:
+                    categories = data
+        else:
+            # Default kategoriyalar (agar fayl yo'q bo'lsa)
+            categories = [
+                {"id": "all", "name": "Все", "icon": "🍽"},
+                {"id": "salad", "name": "Салаты", "icon": "🥗"},
+                {"id": "soup", "name": "Супы", "icon": "🍜"},
+                {"id": "bread", "name": "Хлеб", "icon": "🍞"},
+                {"id": "pide", "name": "Пиде", "icon": "🫓"},
+                {"id": "pizza", "name": "Пицца", "icon": "🍕"},
+                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔"},
+                {"id": "fish", "name": "Рыба", "icon": "🐟"},
+                {"id": "main", "name": "Основные блюда", "icon": "🍖"},
+                {"id": "side", "name": "Гарниры", "icon": "🍟"},
+                {"id": "dessert", "name": "Десерты", "icon": "🍰"},
+                {"id": "fruit", "name": "Фрукты", "icon": "🍇"},
+                {"id": "drink", "name": "Напитки", "icon": "🥤"}
+            ]
+            
+            # Fayl yo'q bo'lsa, yaratib qo'yish (birinchi marta)
+            try:
+                with open(categories_file, 'w', encoding='utf-8') as f:
+                    json.dump({"categories": categories, "updated_at": datetime.utcnow().isoformat()}, 
+                             f, ensure_ascii=False, indent=2)
+                logger.info(f"✅ Default categories.json yaratildi: {categories_file}")
+            except Exception as e:
+                logger.error(f"❌ categories.json yaratishda xato: {e}")
+        
+        # Timestamp ni ham qaytarish (kesh uchun)
+        updated_at = datetime.utcnow().isoformat()
+        
+        # Agar fayldan o'qilgan bo'lsa va updated_at bo'lsa
+        if os.path.exists(categories_file):
+            try:
+                with open(categories_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and 'updated_at' in data:
+                        updated_at = data['updated_at']
+            except:
+                pass
+        
+        logger.info(f"📋 Kategoriyalar so'raldi: {len(categories)} ta")
+        
+        return web.json_response({
+            "success": True,
+            "categories": categories,
+            "count": len(categories),
+            "timestamp": updated_at,
+            "server_time": datetime.utcnow().isoformat()
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"❌ Get categories error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        return web.json_response({
+            "success": False,
+            "error": str(e),
+            "categories": []  # Xatolik bo'lsa ham bo'sh massiv qaytarish
+        }, status=500, headers=get_cors_headers())
 
 async def show_order_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, order: Dict):
     """Buyurtma ma'lumotlarini admin ga qayta ko'rsatish"""
@@ -2224,6 +2328,8 @@ def main():
     
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
+    app.router.add_get('/api/categories', get_categories_handler)
+    app.router.add_post('/api/categories', save_categories_handler)
     
     logger.info(f"🚀 Server ishga tushmoqda: 0.0.0.0:{PORT}")
     logger.info(f"💳 Payme chek parser: Faol")
