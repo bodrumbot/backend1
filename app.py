@@ -1,8 +1,3 @@
-# ==========================================
-# BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
-# To'g'rilangan versiya - Guruh handleri fixparse_payme_receipt
-# ==========================================
-
 import os
 import logging
 import asyncio
