@@ -434,6 +434,75 @@ async def open_payme_group_handler(update: Update, context: ContextTypes.DEFAULT
         parse_mode='HTML'
     )
 
+async def get_menu_handler(request):
+    """Menyuni olish - barcha mijozlar uchun"""
+    try:
+        import json
+        import os
+        
+        # menu.json fayl yo'li
+        menu_file = os.path.join(os.path.dirname(__file__), 'menu.json')
+        
+        # Fayldan menyni o'qish
+        if os.path.exists(menu_file):
+            with open(menu_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Agar JSON da "menu" kaliti bo'lsa
+                if isinstance(data, dict) and 'menu' in data:
+                    menu = data['menu']
+                else:
+                    menu = data
+        else:
+            # Agar fayl yo'q bo'lsa, bo'sh massiv qaytarish
+            menu = []
+        
+        logger.info(f"📋 Menyu so'raldi: {len(menu) if isinstance(menu, list) else 1} ta item")
+        
+        return web.json_response({
+            "success": True,
+            "menu": menu,
+            "count": len(menu) if isinstance(menu, list) else 0,
+            "timestamp": datetime.utcnow().isoformat()
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"❌ Get menu error: {e}")
+        return web.json_response({
+            "success": False,
+            "error": str(e),
+            "menu": []
+        }, status=500, headers=get_cors_headers())
+
+async def save_menu_handler(request):
+    """Menyuni saqlash (faqat admin)"""
+    try:
+        data = await request.json()
+        menu = data.get('menu', [])
+        
+        # JSON faylga saqlash
+        menu_file = os.path.join(os.path.dirname(__file__), 'menu.json')
+        with open(menu_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                "menu": menu,
+                "updated_at": datetime.utcnow().isoformat()
+            }, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"💾 Menyu saqlandi: {len(menu)} ta item")
+        
+        return web.json_response({
+            "success": True,
+            "message": "Menu saved",
+            "count": len(menu),
+            "timestamp": datetime.utcnow().isoformat()
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"❌ Save menu error: {e}")
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
+
 async def save_categories_handler(request):
     """Kategoriyalarni saqlash (faqat admin)"""
     try:
@@ -2323,6 +2392,13 @@ def main():
     
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
+    
+    # Menu API routes
+    app.router.add_get('/api/menu', get_menu_handler)
+    app.router.add_post('/api/menu', save_menu_handler)
+    app.router.add_get('/api/menu/last-update', get_categories_handler)  # Used for sync checking
+    
+    # Categories API routes
     app.router.add_get('/api/categories', get_categories_handler)
     app.router.add_post('/api/categories', save_categories_handler)
     
