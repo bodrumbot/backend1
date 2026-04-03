@@ -458,20 +458,37 @@ async def get_menu_handler(request):
         
         logger.info(f"📋 Menyu so'raldi: {len(menu) if isinstance(menu, list) else 1} ta item")
         
+        # ⭐ KESHNI O'CHIRISH UCHUN HEADERS
+        headers = get_cors_headers()
+        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, proxy-revalidate'
+        headers['Pragma'] = 'no-cache'
+        headers['Expires'] = '0'
+        headers['Surrogate-Control'] = 'no-store'
+        headers['Vary'] = '*'
+        
         return web.json_response({
             "success": True,
             "menu": menu,
             "count": len(menu) if isinstance(menu, list) else 0,
             "timestamp": datetime.utcnow().isoformat()
-        }, headers=get_cors_headers())
+        }, headers=headers)
         
     except Exception as e:
         logger.error(f"❌ Get menu error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Xatolikda ham keshni o'chirish
+        error_headers = get_cors_headers()
+        error_headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        error_headers['Pragma'] = 'no-cache'
+        error_headers['Expires'] = '0'
+        
         return web.json_response({
             "success": False,
             "error": str(e),
             "menu": []
-        }, status=500, headers=get_cors_headers())
+        }, status=500, headers=error_headers)
 
 async def save_menu_handler(request):
     """Menyuni saqlash (faqat admin)"""
