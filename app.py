@@ -143,7 +143,7 @@ def init_database():
                 name VARCHAR(255) NOT NULL,
                 price INTEGER NOT NULL,
                 category VARCHAR(100),
-                image TEXT,
+                image TEXT,  -- VARCHAR o'rniga TEXT (uzun URL lar uchun)
                 description TEXT,
                 available BOOLEAN DEFAULT TRUE,
                 popular BOOLEAN DEFAULT FALSE,
@@ -2405,6 +2405,11 @@ async def init_webhook(app):
     if not init_database():
         logger.error("❌ Database initialization failed!")
         return
+    
+    # ⭐⭐⭐ YANGI: Body size limitini oshirish (100MB)
+    # aiohttp da default 1MB, biz 100MB qilamiz
+    from aiohttp import web
+    web.Request.MAX_CLIENT_SIZE = 100 * 1024 * 1024  # 100MB
     
     # Bot application yaratish
     application = Application.builder().token(TOKEN).build()
