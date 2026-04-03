@@ -85,21 +85,14 @@ logger.info(f"🔧 PAYME_RECEIPTS_GROUP_ID: {PAYME_RECEIPTS_GROUP_ID}, parsed: {
 # Global application
 application = None
 
-# ==========================================
-# DATABASE FUNCTIONS
-# ==========================================
-
-# init_database() funksiyasida orders jadvalini yangilash
-# init_database() funksiyasiga qo'shing (app.py dagi)
-
 def init_database():
-    """Jadval va column'larni avtomatik yaratish/yangilash"""
+    """Jadvallarni yaratish"""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Orders jadvali - tg_id BIGINT ga o'zgartirish
+        # Orders jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -112,7 +105,7 @@ def init_database():
                 payment_status VARCHAR(50) DEFAULT 'pending',
                 payment_method VARCHAR(50) DEFAULT 'payme',
                 location VARCHAR(255),
-                tg_id BIGINT,  -- INTEGER o'rniga BIGINT
+                tg_id BIGINT,
                 notified BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 accepted_at TIMESTAMP,
@@ -129,28 +122,11 @@ def init_database():
             )
         """)
         
-        # ⭐⭐⭐ YANGI: Mavjud tg_id ustunini BIGINT ga o'zgartirish
-        cur.execute("""
-            DO $$
-            BEGIN
-                -- Agar tg_id INTEGER bo'lsa, BIGINT ga o'zgartirish
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns 
-                    WHERE table_name = 'orders' 
-                    AND column_name = 'tg_id'
-                    AND data_type = 'integer'
-                ) THEN
-                    ALTER TABLE orders ALTER COLUMN tg_id TYPE BIGINT;
-                    RAISE NOTICE 'tg_id INTEGER -> BIGINT o''zgartirildi';
-                END IF;
-            END $$;
-        """)
-        
-        # Users jadvali - tg_id BIGINT
+        # Users jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
-                tg_id BIGINT UNIQUE NOT NULL,  -- INTEGER o'rniga BIGINT
+                tg_id BIGINT UNIQUE NOT NULL,
                 name VARCHAR(255),
                 phone VARCHAR(20),
                 username VARCHAR(100),
@@ -159,25 +135,39 @@ def init_database():
             )
         """)
         
-        # ⭐⭐⭐ YANGI: Mavjud users.tg_id ni ham BIGINT ga o'zgartirish
+        # ⭐⭐⭐ YANGI: Menu jadvali
         cur.execute("""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns 
-                    WHERE table_name = 'users' 
-                    AND column_name = 'tg_id'
-                    AND data_type = 'integer'
-                ) THEN
-                    ALTER TABLE users ALTER COLUMN tg_id TYPE BIGINT;
-                    RAISE NOTICE 'users.tg_id INTEGER -> BIGINT o''zgartirildi';
-                END IF;
-            END $$;
+            CREATE TABLE IF NOT EXISTS menu_items (
+                id SERIAL PRIMARY KEY,
+                item_id INTEGER UNIQUE NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                price INTEGER NOT NULL,
+                category VARCHAR(100),
+                image TEXT,
+                description TEXT,
+                available BOOLEAN DEFAULT TRUE,
+                popular BOOLEAN DEFAULT FALSE,
+                is_new BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id VARCHAR(100) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                icon VARCHAR(50) DEFAULT '🍽️',
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """)
         
         conn.commit()
         cur.close()
-        logger.info("✅ Database initialized successfully with BIGINT tg_id")
+        logger.info("✅ Database initialized successfully")
         return True
         
     except Exception as e:
@@ -187,6 +177,153 @@ def init_database():
         if conn:
             conn.close()
 
+def get_menu_from_db():
+    """Database dan menu olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM menu_items ORDER BY item_id")
+        results = cur.fetchall()
+        cur.close()
+        
+        menu = []
+        for row in results:
+            item = {
+                'id': row['item_id'],
+                'name': row['name'],
+                'price': row['price'],
+                'category': row['category'],
+                'image': row['image'],
+                'description': row['description'],
+                'available': row['available'],
+                'popular': row['popular'],
+                'isNew': row['is_new']
+            }
+            menu.append(item)
+        
+        return menu
+        
+    except Exception as e:
+        logger.error(f"❌ Get menu from DB error: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def save_menu_to_db(menu_items):
+    """Menu ni database ga saqlash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Avval barchasini o'chirish
+        cur.execute("DELETE FROM menu_items")
+        
+        # Yangilarni qo'shish
+        for item in menu_items:
+            cur.execute("""
+                INSERT INTO menu_items 
+                (item_id, name, price, category, image, description, available, popular, is_new, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            """, (
+                item.get('id'),
+                item.get('name'),
+                item.get('price'),
+                item.get('category'),
+                item.get('image'),
+                item.get('description'),
+                item.get('available', True),
+                item.get('popular', False),
+                item.get('isNew', False) or item.get('is_new', False)
+            ))
+        
+        conn.commit()
+        cur.close()
+        logger.info(f"✅ Menu saved to DB: {len(menu_items)} items")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Save menu to DB error: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_categories_from_db():
+    """Database dan categories olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM categories ORDER BY sort_order")
+        results = cur.fetchall()
+        cur.close()
+        
+        cats = []
+        for row in results:
+            cat = {
+                'id': row['id'],
+                'name': row['name'],
+                'icon': row['icon'],
+                'sortOrder': row['sort_order']
+            }
+            cats.append(cat)
+        
+        return cats
+        
+    except Exception as e:
+        logger.error(f"❌ Get categories from DB error: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_categories_to_db(categories):
+    """Categories ni database ga saqlash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Avval barchasini o'chirish
+        cur.execute("DELETE FROM categories")
+        
+        # Yangilarni qo'shish
+        for cat in categories:
+            cur.execute("""
+                INSERT INTO categories 
+                (id, name, icon, sort_order, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    icon = EXCLUDED.icon,
+                    sort_order = EXCLUDED.sort_order,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                cat.get('id'),
+                cat.get('name'),
+                cat.get('icon', '🍽️'),
+                cat.get('sortOrder', 0) or cat.get('sort_order', 0)
+            ))
+        
+        conn.commit()
+        cur.close()
+        logger.info(f"✅ Categories saved to DB: {len(categories)} items")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Save categories to DB error: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -435,84 +572,64 @@ async def open_payme_group_handler(update: Update, context: ContextTypes.DEFAULT
     )
 
 async def get_menu_handler(request):
-    """Menyuni olish - barcha mijozlar uchun"""
+    """Menyuni olish - DATABASE dan"""
     try:
-        import json
-        import os
+        menu = get_menu_from_db()
         
-        # menu.json fayl yo'li
-        menu_file = os.path.join(os.path.dirname(__file__), 'menu.json')
+        # Agar bo'sh bo'lsa, default menu ni qaytarish
+        if not menu:
+            logger.warning("⚠️ Menu bo'sh, default qaytarilmoqda")
+            # Default menu ni database ga saqlash
+            default_menu = [...]  # Sizning menuData ingiz
+            save_menu_to_db(default_menu)
+            menu = default_menu
         
-        # Fayldan menyni o'qish
-        if os.path.exists(menu_file):
-            with open(menu_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Agar JSON da "menu" kaliti bo'lsa
-                if isinstance(data, dict) and 'menu' in data:
-                    menu = data['menu']
-                else:
-                    menu = data
-        else:
-            # Agar fayl yo'q bo'lsa, bo'sh massiv qaytarish
-            menu = []
-        
-        logger.info(f"📋 Menyu so'raldi: {len(menu) if isinstance(menu, list) else 1} ta item")
-        
-        # ⭐ KESHNI O'CHIRISH UCHUN HEADERS
         headers = get_cors_headers()
-        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, proxy-revalidate'
-        headers['Pragma'] = 'no-cache'
-        headers['Expires'] = '0'
-        headers['Surrogate-Control'] = 'no-store'
-        headers['Vary'] = '*'
+        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         
         return web.json_response({
             "success": True,
             "menu": menu,
-            "count": len(menu) if isinstance(menu, list) else 0,
+            "count": len(menu),
             "timestamp": datetime.utcnow().isoformat()
         }, headers=headers)
         
     except Exception as e:
         logger.error(f"❌ Get menu error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        # Xatolikda ham keshni o'chirish
-        error_headers = get_cors_headers()
-        error_headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        error_headers['Pragma'] = 'no-cache'
-        error_headers['Expires'] = '0'
-        
         return web.json_response({
             "success": False,
             "error": str(e),
             "menu": []
-        }, status=500, headers=error_headers)
+        }, status=500, headers=get_cors_headers())
+
 
 async def save_menu_handler(request):
-    """Menyuni saqlash (faqat admin)"""
+    """Menyuni saqlash - DATABASE ga"""
     try:
         data = await request.json()
         menu = data.get('menu', [])
         
-        # JSON faylga saqlash
-        menu_file = os.path.join(os.path.dirname(__file__), 'menu.json')
-        with open(menu_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                "menu": menu,
-                "updated_at": datetime.utcnow().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        if not isinstance(menu, list):
+            return web.json_response({
+                "success": False,
+                "error": "Menu must be an array"
+            }, status=400, headers=get_cors_headers())
         
-        logger.info(f"💾 Menyu saqlandi: {len(menu)} ta item")
+        success = save_menu_to_db(menu)
         
-        return web.json_response({
-            "success": True,
-            "message": "Menu saved",
-            "count": len(menu),
-            "timestamp": datetime.utcnow().isoformat()
-        }, headers=get_cors_headers())
-        
+        if success:
+            return web.json_response({
+                "success": True,
+                "message": "Menu saved to database",
+                "count": len(menu),
+                "timestamp": datetime.utcnow().isoformat()
+            }, headers=get_cors_headers())
+        else:
+            return web.json_response({
+                "success": False,
+                "error": "Failed to save menu"
+            }, status=500, headers=get_cors_headers())
+            
     except Exception as e:
         logger.error(f"❌ Save menu error: {e}")
         return web.json_response({
@@ -521,106 +638,39 @@ async def save_menu_handler(request):
         }, status=500, headers=get_cors_headers())
 
 async def save_categories_handler(request):
-    """Kategoriyalarni saqlash (faqat admin)"""
+    """Kategoriyalarni saqlash - DATABASE ga"""
     try:
         data = await request.json()
         categories = data.get('categories', [])
         
-        # JSON faylga saqlash
-        with open('categories.json', 'w', encoding='utf-8') as f:
-            json.dump(categories, f, ensure_ascii=False, indent=2)
+        if not isinstance(categories, list):
+            return web.json_response({
+                "success": False,
+                "error": "Categories must be an array"
+            }, status=400, headers=get_cors_headers())
         
-        return web.json_response({
-            "success": True,
-            "message": "Categories saved",
-            "timestamp": datetime.utcnow().isoformat()
-        }, headers=get_cors_headers())
+        success = save_categories_to_db(categories)
         
+        if success:
+            return web.json_response({
+                "success": True,
+                "message": "Categories saved to database",
+                "count": len(categories),
+                "timestamp": datetime.utcnow().isoformat()
+            }, headers=get_cors_headers())
+        else:
+            return web.json_response({
+                "success": False,
+                "error": "Failed to save categories"
+            }, status=500, headers=get_cors_headers())
+            
     except Exception as e:
-        logger.error(f"Save categories error: {e}")
+        logger.error(f"❌ Save categories error: {e}")
         return web.json_response({
             "success": False,
             "error": str(e)
         }, status=500, headers=get_cors_headers())
 
-async def get_categories_handler(request):
-    """Kategoriyalarni olish - barcha mijozlar uchun"""
-    try:
-        import json
-        import os
-        
-        # categories.json fayl yo'li
-        categories_file = os.path.join(os.path.dirname(__file__), 'categories.json')
-        
-        # Fayldan kategoriyalarni o'qish
-        if os.path.exists(categories_file):
-            with open(categories_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Agar JSON da "categories" kaliti bo'lsa
-                if isinstance(data, dict) and 'categories' in data:
-                    categories = data['categories']
-                else:
-                    categories = data
-        else:
-            # Default kategoriyalar (agar fayl yo'q bo'lsa)
-            categories = [
-                {"id": "all", "name": "Все", "icon": "🍽"},
-                {"id": "salad", "name": "Салаты", "icon": "🥗"},
-                {"id": "soup", "name": "Супы", "icon": "🍜"},
-                {"id": "bread", "name": "Хлеб", "icon": "🍞"},
-                {"id": "pide", "name": "Пиде", "icon": "🫓"},
-                {"id": "pizza", "name": "Пицца", "icon": "🍕"},
-                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔"},
-                {"id": "fish", "name": "Рыба", "icon": "🐟"},
-                {"id": "main", "name": "Основные блюда", "icon": "🍖"},
-                {"id": "side", "name": "Гарниры", "icon": "🍟"},
-                {"id": "dessert", "name": "Десерты", "icon": "🍰"},
-                {"id": "fruit", "name": "Фрукты", "icon": "🍇"},
-                {"id": "drink", "name": "Напитки", "icon": "🥤"}
-            ]
-            
-            # Fayl yo'q bo'lsa, yaratib qo'yish (birinchi marta)
-            try:
-                with open(categories_file, 'w', encoding='utf-8') as f:
-                    json.dump({"categories": categories, "updated_at": datetime.utcnow().isoformat()}, 
-                             f, ensure_ascii=False, indent=2)
-                logger.info(f"✅ Default categories.json yaratildi: {categories_file}")
-            except Exception as e:
-                logger.error(f"❌ categories.json yaratishda xato: {e}")
-        
-        # Timestamp ni ham qaytarish (kesh uchun)
-        updated_at = datetime.utcnow().isoformat()
-        
-        # Agar fayldan o'qilgan bo'lsa va updated_at bo'lsa
-        if os.path.exists(categories_file):
-            try:
-                with open(categories_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, dict) and 'updated_at' in data:
-                        updated_at = data['updated_at']
-            except:
-                pass
-        
-        logger.info(f"📋 Kategoriyalar so'raldi: {len(categories)} ta")
-        
-        return web.json_response({
-            "success": True,
-            "categories": categories,
-            "count": len(categories),
-            "timestamp": updated_at,
-            "server_time": datetime.utcnow().isoformat()
-        }, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"❌ Get categories error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        return web.json_response({
-            "success": False,
-            "error": str(e),
-            "categories": []  # Xatolik bo'lsa ham bo'sh massiv qaytarish
-        }, status=500, headers=get_cors_headers())
 
 async def show_order_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, order: Dict):
     """Buyurtma ma'lumotlarini admin ga qayta ko'rsatish"""
@@ -1333,6 +1383,68 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     finally:
         if conn:
             conn.close()
+
+
+async def get_categories_handler(request):
+    """Kategoriyalarni olish - DATABASE dan"""
+    try:
+        categories = get_categories_from_db()
+        
+        # Agar bo'sh bo'lsa, default categories ni qaytarish va saqlash
+        if not categories:
+            logger.warning("⚠️ Categories bo'sh, default qaytarilmoqda")
+            categories = [
+                {"id": "all", "name": "Все", "icon": "🍽", "sortOrder": 0},
+                {"id": "salad", "name": "Салаты", "icon": "🥗", "sortOrder": 1},
+                {"id": "soup", "name": "Супы", "icon": "🍜", "sortOrder": 2},
+                {"id": "bread", "name": "Хлеб", "icon": "🍞", "sortOrder": 3},
+                {"id": "pide", "name": "Пиде", "icon": "🫓", "sortOrder": 4},
+                {"id": "pizza", "name": "Пицца", "icon": "🍕", "sortOrder": 5},
+                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔", "sortOrder": 6},
+                {"id": "fish", "name": "Рыба", "icon": "🐟", "sortOrder": 7},
+                {"id": "main", "name": "Основные блюда", "icon": "🍖", "sortOrder": 8},
+                {"id": "side", "name": "Гарниры", "icon": "🍟", "sortOrder": 9},
+                {"id": "dessert", "name": "Десерты", "icon": "🍰", "sortOrder": 10},
+                {"id": "fruit", "name": "Фрукты", "icon": "🍇", "sortOrder": 11},
+                {"id": "drink", "name": "Напитки", "icon": "🥤", "sortOrder": 12}
+            ]
+            save_categories_to_db(categories)
+        
+        return web.json_response({
+            "success": True,
+            "categories": categories,
+            "count": len(categories),
+            "timestamp": datetime.utcnow().isoformat(),
+            "server_time": datetime.utcnow().isoformat()
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"❌ Get categories error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Xatolik bo'lsa ham default qaytarish
+        return web.json_response({
+            "success": True,  # Muhim: success=True qilish
+            "categories": [
+                {"id": "all", "name": "Все", "icon": "🍽", "sortOrder": 0},
+                {"id": "salad", "name": "Салаты", "icon": "🥗", "sortOrder": 1},
+                {"id": "soup", "name": "Супы", "icon": "🍜", "sortOrder": 2},
+                {"id": "bread", "name": "Хлеб", "icon": "🍞", "sortOrder": 3},
+                {"id": "pide", "name": "Пиде", "icon": "🫓", "sortOrder": 4},
+                {"id": "pizza", "name": "Пицца", "icon": "🍕", "sortOrder": 5},
+                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔", "sortOrder": 6},
+                {"id": "fish", "name": "Рыба", "icon": "🐟", "sortOrder": 7},
+                {"id": "main", "name": "Основные блюда", "icon": "🍖", "sortOrder": 8},
+                {"id": "side", "name": "Гарниры", "icon": "🍟", "sortOrder": 9},
+                {"id": "dessert", "name": "Десерты", "icon": "🍰", "sortOrder": 10},
+                {"id": "fruit", "name": "Фрукты", "icon": "🍇", "sortOrder": 11},
+                {"id": "drink", "name": "Напитки", "icon": "🥤", "sortOrder": 12}
+            ],
+            "count": 13,
+            "error": str(e)  # Xato haqida ma'lumot
+        }, headers=get_cors_headers())
+
 
 async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
