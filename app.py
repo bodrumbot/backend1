@@ -1764,14 +1764,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items = json.loads(items)
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
+        # ⭐⭐⭐ YANGI: Telefon raqamini olish
+        phone_display = format_phone_display(order.get('phone', ''))
+        
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_accept_{order_id}")]
         ])
         
+        # ⭐⭐⭐ YANGI: Telefon raqami qo'shildi
         prompt_message = (
             "⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
             f"🆔 Buyurtma: #{order_id[-6:]}\n"
             f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
+            f"📞 <b>Telefon:</b> {phone_display}\n"  # ⭐ Telefon qo'shildi
             f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
             f"🍽 Mahsulotlar:\n{items_text}\n\n"
             "✍️ <b>Tayyorlanish vaqtini kiriting:</b>\n"
