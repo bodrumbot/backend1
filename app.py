@@ -1,29 +1,27 @@
 import os
 import logging
 import asyncio
-from flask import app
-import psycopg2
-import psycopg2.extras
+import json
+import re
+import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
-import requests
-import time
-import re
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Chat
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
-    filters,
-    JobQueue
+    filters
 )
 from aiohttp import web
-import json
-import aiohttp_cors
-
+import aiohttp
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
@@ -36,60 +34,39 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # ENVIRONMENT VARIABLES
 # ==========================================
-
-PORT = int(os.getenv("PORT", "3000"))
+PORT = int(os.getenv("PORT", "8080"))
 DATABASE_URL = (os.getenv("DATABASE_PUBLIC_URL") or 
                 os.getenv("DATABASE_URL") or 
                 os.getenv("DATABASE_PRIVATE_URL") or
                 os.getenv("POSTGRES_URL"))
-
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
-
-# ⭐ MUHIM: Payme cheklar keladigan guruh ID si
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 PAYME_RECEIPTS_GROUP_ID = os.getenv("PAYME_RECEIPTS_GROUP_ID", "")
+PAYME_GROUP_USERNAME = os.getenv("PAYME_GROUP_USERNAME", "bodrumbota")
 
-
-
-# ⭐ YANGI: Guruh ID sini to'g'ri parse qilish
-def parse_chat_id(chat_id_str):
-    """Guruh yoki user ID sini to'g'ri formatga o'tkazish"""
-    if not chat_id_str:
-        return 0
-    try:
-        # Faqat raqamlarni olish
-        chat_id = str(chat_id_str).strip()
-        # Agar -100 bilan boshlansa (guruh) yoki - bilan boshlansa
-        if chat_id.startswith('-100'):
-            return int(chat_id)
-        elif chat_id.startswith('-'):
-            return int(chat_id)
-        else:
-            return int(chat_id)
-    except Exception as e:
-        logger.error(f"Chat ID parse xatosi: {e}")
-        return 0
-
-try:
-    ADMIN_CHAT_ID_INT = parse_chat_id(ADMIN_CHAT_ID)
-    PAYME_GROUP_ID_INT = parse_chat_id(PAYME_RECEIPTS_GROUP_ID)
-except ValueError as e:
-    logger.error(f"Chat ID parse xatosi: {e}")
-    ADMIN_CHAT_ID_INT = 0
-    PAYME_GROUP_ID_INT = 0
-
-logger.info(f"🔧 ADMIN_CHAT_ID: {ADMIN_CHAT_ID}, parsed: {ADMIN_CHAT_ID_INT}")
-logger.info(f"🔧 PAYME_RECEIPTS_GROUP_ID: {PAYME_RECEIPTS_GROUP_ID}, parsed: {PAYME_GROUP_ID_INT}")
-
-# Global application
+# Global variables
 application = None
+db_pool = None
+scheduler = None
 
+# ==========================================
+# DATABASE CONNECTION POOLING
+# ==========================================
 def init_database():
-    """Jadvallarni yaratish"""
-    conn = None
+    """Database pool yaratish va jadvallarni tekshirish"""
+    global db_pool
     try:
-        conn = get_db_connection()
+        db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 20,  # min, max connections
+            DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        logger.info("✅ Database pool yaratildi")
+        
+        # Jadvallarni yaratish
+        conn = db_pool.getconn()
         cur = conn.cursor()
         
         # Orders jadvali
@@ -135,7 +112,7 @@ def init_database():
             )
         """)
         
-        # ⭐⭐⭐ YANGI: Menu jadvali
+        # Menu jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS menu_items (
                 id SERIAL PRIMARY KEY,
@@ -143,7 +120,7 @@ def init_database():
                 name VARCHAR(255) NOT NULL,
                 price INTEGER NOT NULL,
                 category VARCHAR(100),
-                image TEXT,  -- VARCHAR o'rniga TEXT (uzun URL lar uchun)
+                image TEXT,
                 description TEXT,
                 available BOOLEAN DEFAULT TRUE,
                 popular BOOLEAN DEFAULT FALSE,
@@ -153,7 +130,7 @@ def init_database():
             )
         """)
         
-
+        # Categories jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id VARCHAR(100) PRIMARY KEY,
@@ -165,181 +142,495 @@ def init_database():
             )
         """)
         
+        # ⭐ YANGI: Admin states jadvali (RAM o'rniga database)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_states (
+                admin_id BIGINT PRIMARY KEY,
+                state_type VARCHAR(50),
+                order_id VARCHAR(100),
+                data JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP + INTERVAL '2 hours'
+            )
+        """)
+        
+        # Indexlar
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_tg_id ON orders(tg_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
+        
         conn.commit()
         cur.close()
+        db_pool.putconn(conn)
+        
         logger.info("✅ Database initialized successfully")
         return True
         
     except Exception as e:
         logger.error(f"❌ Database init error: {e}")
         return False
-    finally:
-        if conn:
-            conn.close()
-
-def get_menu_from_db():
-    """Database dan menu olish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM menu_items ORDER BY item_id")
-        results = cur.fetchall()
-        cur.close()
-        
-        menu = []
-        for row in results:
-            item = {
-                'id': row['item_id'],
-                'name': row['name'],
-                'price': row['price'],
-                'category': row['category'],
-                'image': row['image'],
-                'description': row['description'],
-                'available': row['available'],
-                'popular': row['popular'],
-                'isNew': row['is_new']
-            }
-            menu.append(item)
-        
-        return menu
-        
-    except Exception as e:
-        logger.error(f"❌ Get menu from DB error: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-def save_menu_to_db(menu_items):
-    """Menu ni database ga saqlash"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Avval barchasini o'chirish
-        cur.execute("DELETE FROM menu_items")
-        
-        # Yangilarni qo'shish
-        for item in menu_items:
-            cur.execute("""
-                INSERT INTO menu_items 
-                (item_id, name, price, category, image, description, available, popular, is_new, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-            """, (
-                item.get('id'),
-                item.get('name'),
-                item.get('price'),
-                item.get('category'),
-                item.get('image'),
-                item.get('description'),
-                item.get('available', True),
-                item.get('popular', False),
-                item.get('isNew', False) or item.get('is_new', False)
-            ))
-        
-        conn.commit()
-        cur.close()
-        logger.info(f"✅ Menu saved to DB: {len(menu_items)} items")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Save menu to DB error: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-def get_categories_from_db():
-    """Database dan categories olish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM categories ORDER BY sort_order")
-        results = cur.fetchall()
-        cur.close()
-        
-        cats = []
-        for row in results:
-            cat = {
-                'id': row['id'],
-                'name': row['name'],
-                'icon': row['icon'],
-                'sortOrder': row['sort_order']
-            }
-            cats.append(cat)
-        
-        return cats
-        
-    except Exception as e:
-        logger.error(f"❌ Get categories from DB error: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-
-def save_categories_to_db(categories):
-    """Categories ni database ga saqlash"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Avval barchasini o'chirish
-        cur.execute("DELETE FROM categories")
-        
-        # Yangilarni qo'shish
-        for cat in categories:
-            cur.execute("""
-                INSERT INTO categories 
-                (id, name, icon, sort_order, updated_at)
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    icon = EXCLUDED.icon,
-                    sort_order = EXCLUDED.sort_order,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (
-                cat.get('id'),
-                cat.get('name'),
-                cat.get('icon', '🍽️'),
-                cat.get('sortOrder', 0) or cat.get('sort_order', 0)
-            ))
-        
-        conn.commit()
-        cur.close()
-        logger.info(f"✅ Categories saved to DB: {len(categories)} items")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Save categories to DB error: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
 
 def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL not set!")
-    try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-        return conn
-    except Exception as e:
-        logger.error(f"Database connection error: {e}")
-        raise
+    """Database connection olish"""
+    if db_pool:
+        return db_pool.getconn()
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
+def put_db_connection(conn):
+    """Connection ni qaytarish"""
+    if db_pool and conn:
+        db_pool.putconn(conn)
+
+# ==========================================
+# ADMIN STATE MANAGEMENT (Database based)
+# ==========================================
+def save_admin_state(admin_id: int, state_type: str, order_id: str, data: dict = None):
+    """Admin holatini bazada saqlash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO admin_states (admin_id, state_type, order_id, data, expires_at)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP + INTERVAL '2 hours')
+            ON CONFLICT (admin_id) DO UPDATE SET
+                state_type = EXCLUDED.state_type,
+                order_id = EXCLUDED.order_id,
+                data = EXCLUDED.data,
+                created_at = CURRENT_TIMESTAMP,
+                expires_at = EXCLUDED.expires_at
+        """, (admin_id, state_type, order_id, json.dumps(data) if data else None))
+        conn.commit()
+        cur.close()
+        logger.info(f"💾 Admin state saqlandi: {admin_id}, {state_type}, {order_id}")
+    except Exception as e:
+        logger.error(f"❌ State saqlash xatosi: {e}")
+    finally:
+        put_db_connection(conn)
+
+def get_admin_state(admin_id: int):
+    """Admin holatini olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM admin_states 
+            WHERE admin_id = %s AND expires_at > CURRENT_TIMESTAMP
+        """, (admin_id,))
+        result = cur.fetchone()
+        cur.close()
+        return result
+    except Exception as e:
+        logger.error(f"❌ State olish xatosi: {e}")
+        return None
+    finally:
+        put_db_connection(conn)
+
+def clear_admin_state(admin_id: int):
+    """Admin holatini tozalash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admin_states WHERE admin_id = %s", (admin_id,))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        logger.error(f"❌ State tozalash xatosi: {e}")
+    finally:
+        put_db_connection(conn)
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def parse_chat_id(chat_id_str):
+    """Guruh yoki user ID sini to'g'ri formatga o'tkazish"""
+    if not chat_id_str:
+        return 0
+    try:
+        chat_id = str(chat_id_str).strip()
+        if chat_id.startswith('-100'):
+            return int(chat_id)
+        elif chat_id.startswith('-'):
+            return int(chat_id)
+        else:
+            return int(chat_id)
+    except Exception as e:
+        logger.error(f"Chat ID parse xatosi: {e}")
+        return 0
+
+try:
+    ADMIN_CHAT_ID_INT = parse_chat_id(ADMIN_CHAT_ID)
+    PAYME_GROUP_ID_INT = parse_chat_id(PAYME_RECEIPTS_GROUP_ID)
+except ValueError as e:
+    logger.error(f"Chat ID parse xatosi: {e}")
+    ADMIN_CHAT_ID_INT = 0
+    PAYME_GROUP_ID_INT = 0
+
+def format_price(price: int) -> str:
+    return f"{price:,}".replace(",", " ")
+
+def format_phone_display(phone: str) -> str:
+    """Telefon raqamini ko'rsatish uchun formatlash"""
+    if not phone:
+        return "Noma'lum"
+    phone = ''.join(filter(str.isdigit, str(phone)))
+    if phone.startswith('998'):
+        phone = phone[3:]
+    phone = phone[-9:] if len(phone) > 9 else phone
+    return f"+998{phone}"
+
+def get_cors_headers():
+    return {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+    }
+
+# ==========================================
+# DATABASE OPERATIONS
+# ==========================================
+def create_order(data: Dict) -> Optional[Dict]:
+    """Yangi buyurtma yaratish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        items = data.get('items', [])
+        if isinstance(items, list):
+            items_json = json.dumps(items)
+        else:
+            items_json = str(items) if items else '[]'
+
+        tg_id = None
+        try:
+            tg_id_raw = data.get('tgId') or data.get('tg_id')
+            if tg_id_raw and str(tg_id_raw).isdigit():
+                tg_id = int(tg_id_raw)
+            elif tg_id_raw:
+                clean_id = str(tg_id_raw).replace('tg_', '').replace('user_', '')
+                if clean_id.isdigit():
+                    tg_id = int(clean_id)
+        except Exception as e:
+            logger.error(f"❌ tg_id conversion xatosi: {e}")
+            tg_id = None
+
+        order_id = data.get('orderId')
+        name = data.get('name', 'Mijoz')
+        phone = data.get('phone', '000000000')
+        total = data.get('total', 0)
+        location = data.get('location')
+        source = data.get('source', 'website')
+        return_url = data.get('returnUrl')
+
+        cur.execute("""
+            INSERT INTO orders (
+                order_id, name, phone, items, total, 
+                status, payment_status, payment_method, 
+                location, tg_id, notified, created_at,
+                source
+            )
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            order_id, name, phone, items_json, total, 
+            'pending_payment', 'pending', 'payme',
+            location, tg_id, False, datetime.utcnow(),
+            source
+        ))
+
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+
+        if result:
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}")
+            return order_dict
+        return None
+
+    except Exception as e:
+        logger.error(f"❌ Create order ERROR: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+    finally:
+        put_db_connection(conn)
+
+def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    """Buyurtmani olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM orders WHERE order_id ILIKE %s", (order_id,))
+        result = cur.fetchone()
+        cur.close()
+
+        if result:
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
+    except Exception as e:
+        logger.error(f"Get order error: {e}")
+        return None
+    finally:
+        put_db_connection(conn)
+
+def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[str, Any]]:
+    """Buyurtma statusini yangilash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+        existing = cur.fetchone()
+
+        if not existing:
+            return None
+
+        update_data = {'status': status}
+
+        timestamp_fields = {
+            'accepted': 'accepted_at',
+            'rejected': 'rejected_at', 
+            'confirmed': 'confirmed_at',
+            'pending_payment': None,
+            'pending': None
+        }
+
+        if status in timestamp_fields and timestamp_fields[status]:
+            update_data[timestamp_fields[status]] = datetime.utcnow()
+
+        if status == 'confirmed':
+            update_data['accepted_at'] = datetime.utcnow()
+
+        if kwargs.get('paid_at'):
+            update_data['paid_at'] = kwargs.get('paid_at')
+
+        if 'notified' in kwargs:
+            update_data['notified'] = kwargs['notified']
+            
+        if 'admin_note' in kwargs:
+            update_data['admin_note'] = kwargs['admin_note']
+
+        fields = []
+        values = []
+        for key, val in update_data.items():
+            fields.append(f"{key} = %s")
+            values.append(val)
+        values.append(order_id)
+
+        query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s RETURNING *"
+        cur.execute(query, values)
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+
+        if result:
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
+
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        return None
+    finally:
+        put_db_connection(conn)
+
+def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
+    """Foydalanuvchi profilini saqlash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            INSERT INTO users (tg_id, name, phone, username, updated_at)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (tg_id) 
+            DO UPDATE SET 
+                name = EXCLUDED.name,
+                phone = EXCLUDED.phone,
+                username = EXCLUDED.username,
+                updated_at = CURRENT_TIMESTAMP
+        """, (tg_id, name, phone, username))
+        
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Profil saqlash xatosi: {e}")
+        return False
+    finally:
+        put_db_connection(conn)
+
+def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
+    """Foydalanuvchi profilini olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE tg_id = %s", (tg_id,))
+        result = cur.fetchone()
+        cur.close()
+        
+        if result:
+            profile = dict(result)
+            for key in ['created_at', 'updated_at']:
+                if profile.get(key) and hasattr(profile[key], 'isoformat'):
+                    profile[key] = profile[key].isoformat()
+            return profile
+        return None
+    except Exception as e:
+        logger.error(f"❌ Profil olish xatosi: {e}")
+        return None
+    finally:
+        put_db_connection(conn)
+
+# ==========================================
+# NOTIFICATION FUNCTIONS
+# ==========================================
+async def notify_admin_new_order(order: Dict):
+    """Admin ga yangi buyurtma haqida xabar"""
+    try:
+        logger.info(f"🔔 Yangi buyurtma admin ga: {order.get('order_id')}")
+
+        if not ADMIN_CHAT_ID_INT:
+            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
+            return False
+
+        global application
+        if not application or not application.bot:
+            logger.error("❌ Bot mavjud emas!")
+            return False
+        
+        bot = application.bot
+
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        phone_display = format_phone_display(order.get('phone', ''))
+        customer_name = order.get('name', 'Mijoz')
+        location = order.get('location')
+        location_text = ""
+        
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+            except:
+                pass
+
+        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
+
+        admin_message = f"""{status_text}
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {customer_name}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}
+
+<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [
+                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
+            ]
+        ])
+
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID_INT,
+            text=admin_message,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
+        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+async def notify_customer_accepted(bot, order: Dict, prep_time: str):
+    """Buyurtma qabul qilinganda mijozga xabar"""
+    tg_id = order.get('tg_id') or order.get('tgId')
+    
+    if tg_id and isinstance(tg_id, str):
+        try:
+            tg_id = int(tg_id)
+        except ValueError:
+            tg_id = None
+    
+    if not tg_id or tg_id == 0:
+        logger.warning(f"⚠️ Mijoz tg_id yo'q: {order.get('order_id')}")
+        return False
+    
+    try:
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]]) if items else "Ma'lumot yo'q"
+        if len(items) > 3:
+            items_short += f" va yana {len(items)-3} ta"
+        
+        order_id_short = str(order.get('order_id', 'N/A'))[-6:]
+        total_price = format_price(order.get('total', 0))
+        
+        customer_message = (
+            "🎉 <b>Buyurtmangiz qabul qilindi!</b>\n\n"
+            f"🆔 <b>Buyurtma raqami:</b> #{order_id_short}\n"
+            f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
+            f"💵 <b>Summa:</b> {total_price} so'm\n\n"
+            f"🍽 <b>Buyurtma:</b> {items_short}\n\n"
+            "👨‍🍳 Oshxonada tayyorlanmoqda...\n"
+            "🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
+            "📞 Savollar bo'yicha: +998882015020"
+        )
+        
+        await bot.send_message(chat_id=int(tg_id), text=customer_message, parse_mode='HTML')
+        logger.info(f"✅ Mijozga qabul xabari yuborildi: {tg_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Mijozga xabar yuborishda xato: {e}")
+        return False
+
+# ==========================================
+# HANDLERS
+# ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start handler"""
     user = update.effective_user
-    
-    # ⭐ DEBUG: Kim start bosayotganini ko'rish
     logger.info(f"🚀 /start - User ID: {user.id}, Admin ID: {ADMIN_CHAT_ID_INT}")
     
     is_admin = (user.id == ADMIN_CHAT_ID_INT)
@@ -371,11 +662,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if profile and profile.get('phone'):
         name = profile.get('name', 'Foydalanuvchi')
         phone = profile.get('phone', '')
-        
-        # Telefon formatini chiroyli qilish
-        formatted_phone = phone
-        if len(phone) == 9:
-            formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
+        formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}" if len(phone) == 9 else phone
         
         keyboard = [
             [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
@@ -390,7 +677,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
     else:
-        # Ro'yxatdan o'tmagan foydalanuvchi
         keyboard = ReplyKeyboardMarkup(
             [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
             resize_keyboard=True,
@@ -405,776 +691,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-# ==========================================
-# TELEGRAM BOT API DIRECT FUNCTIONS
-# ==========================================
-
-def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML', reply_markup=None) -> bool:
-    """Direct API call to send message"""
-    if not TOKEN:
-        logger.error("❌ TOKEN not set")
-        return False
-    
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        payload = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': parse_mode
-        }
-        if reply_markup:
-            payload['reply_markup'] = json.dumps(reply_markup.to_dict() if hasattr(reply_markup, 'to_dict') else reply_markup)
-        
-        response = requests.post(url, json=payload, timeout=10)
-        result = response.json()
-        
-        if result.get('ok'):
-            logger.info(f"✅ Message sent to {chat_id}")
-            return True
-        else:
-            logger.error(f"❌ Telegram API error: {result}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ send_telegram_message error: {e}")
-        return False
-
-def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> bool:
-    """Direct API call to send location"""
-    if not TOKEN:
-        return False
-    
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendLocation"
-        payload = {
-            'chat_id': chat_id,
-            'latitude': latitude,
-            'longitude': longitude
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json().get('ok', False)
-    except Exception as e:
-        logger.error(f"❌ send_telegram_location error: {e}")
-        return False
-
-# ==========================================
-# PAYME CHEK PARSER - FAQAT ORDER ID
-# ==========================================
-
-def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
-    """Payme chek parse - faqat ORDER ID ni oladi, qolganini ignore qiladi"""
-    try:
-        if not text:
-            return None
-        
-        # Faqat ORD_ patternini qidirish - eng muhim qism
-        # Format: ORD_1234567890_abcdefgh (case insensitive)
-        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text, re.IGNORECASE)
-        
-        if not order_match:
-            logger.debug("❌ ORDER ID pattern topilmadi")
-            return None
-        
-        # Order ID ni olamiz (asl holida)
-        order_id = order_match.group(0)
-        
-        logger.info(f"✅ ORDER ID topildi: {order_id}")
-        
-        # Qolgan ma'lumotlarni ham olishga harakat qilamiz (agar bo'lsa)
-        # Agar regex ishlamasa ham, order_id ni qaytaramiz
-        
-        # Summa (ixtiyoriy)
-        amount = 0
-        try:
-            # 🇺🇿 1 000,00 сум yoki 1 000,00 so'm
-            amount_match = re.search(r'[\d\s,]+\s*(?:сум|so\'m|s\'om)', text, re.IGNORECASE)
-            if amount_match:
-                amount_str = amount_match.group(0).replace('сум', '').replace('so\'m', '').replace('s\'om', '').replace(' ', '').replace(',', '.').strip()
-                amount = int(float(amount_str))
-        except:
-            pass
-        
-        # Transaction ID (ixtiyoriy)
-        transaction_id = None
-        try:
-            trans_match = re.search(r'[a-f0-9]{24}', text, re.IGNORECASE)
-            if trans_match:
-                transaction_id = trans_match.group(0)
-        except:
-            pass
-        
-        # Chek ID (ixtiyoriy)
-        receipt_id = None
-        try:
-            # 🧾 569 yoki shunga o'xshash
-            receipt_match = re.search(r'🧾\s*(\d+)', text)
-            if receipt_match:
-                receipt_id = receipt_match.group(1)
-        except:
-            pass
-        
-        result = {
-            'order_id': order_id,
-            'amount': amount,
-            'card_mask': None,  # Endi shart emas
-            'receipt_id': receipt_id,
-            'transaction_id': transaction_id,
-            'customer_name': None,  # Endi shart emas
-            'raw_text': text[:100]  # Log uchun qisqa matn
-        }
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"❌ Chek parse xatosi: {e}")
-        return None
-        
-
-
-
-# ==========================================
-# PAYME GURUHIGA O'TISH VA TEKSHIRISH
-# ==========================================
-
-def get_payme_group_link(order_id: str) -> str:
-    """Payme guruhiga o'tish uchun link yaratish"""
-    # Guruh username yoki invite link
-    # O'zingizning guruh username ni yozing
-    PAYME_GROUP_USERNAME = "bodrumbota"  # O'zgartiring!
-    
-    # Order ID ni qidirish uchun guruhga o'tish
-    # Telegram deep link orqali guruhga o'tish va qidirish
-    return f"https://t.me/{PAYME_GROUP_USERNAME}?q={order_id}"
-
-async def open_payme_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme guruhiga o'tish tugmasi handleri"""
-    query = update.callback_query
-    await query.answer()
-    
-    order_id = query.data.replace("open_payme_group_", "")
-    
-    # Guruhga o'tish linkini yaratish
-    group_link = get_payme_group_link(order_id)
-    
-    # Inline keyboard bilan guruhga o'tish tugmasi
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
-        [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
-    ])
-    
-    await query.edit_message_text(
-        f"💳 <b>To'lovni tekshirish</b>\n\n"
-        f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
-        f"Payme guruhiga o'tib, quyidagi ORDER ID ni qidiring:\n"
-        f"<code>{order_id}</code>\n\n"
-        f"To'lov topilsa, qaytib kelib \"Qabul qilish\" ni bosing.",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-
-async def get_menu_handler(request):
-    """Menyuni olish - DATABASE dan"""
-    try:
-        menu = get_menu_from_db()
-        
-        # Agar bo'sh bo'lsa, default menu ni qaytarish
-        if not menu:
-            logger.warning("⚠️ Menu bo'sh, default qaytarilmoqda")
-            # Default menu ni database ga saqlash
-            default_menu = [...]  # Sizning menuData ingiz
-            save_menu_to_db(default_menu)
-            menu = default_menu
-        
-        headers = get_cors_headers()
-        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        
-        return web.json_response({
-            "success": True,
-            "menu": menu,
-            "count": len(menu),
-            "timestamp": datetime.utcnow().isoformat()
-        }, headers=headers)
-        
-    except Exception as e:
-        logger.error(f"❌ Get menu error: {e}")
-        return web.json_response({
-            "success": False,
-            "error": str(e),
-            "menu": []
-        }, status=500, headers=get_cors_headers())
-
-
-async def save_menu_handler(request):
-    """Menyuni saqlash - DATABASE ga"""
-    try:
-        data = await request.json()
-        menu = data.get('menu', [])
-        
-        if not isinstance(menu, list):
-            return web.json_response({
-                "success": False,
-                "error": "Menu must be an array"
-            }, status=400, headers=get_cors_headers())
-        
-        success = save_menu_to_db(menu)
-        
-        if success:
-            return web.json_response({
-                "success": True,
-                "message": "Menu saved to database",
-                "count": len(menu),
-                "timestamp": datetime.utcnow().isoformat()
-            }, headers=get_cors_headers())
-        else:
-            return web.json_response({
-                "success": False,
-                "error": "Failed to save menu"
-            }, status=500, headers=get_cors_headers())
-            
-    except Exception as e:
-        logger.error(f"❌ Save menu error: {e}")
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
-async def save_categories_handler(request):
-    """Kategoriyalarni saqlash - DATABASE ga"""
-    try:
-        data = await request.json()
-        categories = data.get('categories', [])
-        
-        if not isinstance(categories, list):
-            return web.json_response({
-                "success": False,
-                "error": "Categories must be an array"
-            }, status=400, headers=get_cors_headers())
-        
-        success = save_categories_to_db(categories)
-        
-        if success:
-            return web.json_response({
-                "success": True,
-                "message": "Categories saved to database",
-                "count": len(categories),
-                "timestamp": datetime.utcnow().isoformat()
-            }, headers=get_cors_headers())
-        else:
-            return web.json_response({
-                "success": False,
-                "error": "Failed to save categories"
-            }, status=500, headers=get_cors_headers())
-            
-    except Exception as e:
-        logger.error(f"❌ Save categories error: {e}")
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
-
-async def show_order_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, order: Dict):
-    """Buyurtma ma'lumotlarini admin ga qayta ko'rsatish"""
-    items = order.get('items', [])
-    if isinstance(items, str):
-        items = json.loads(items)
-    
-    items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-    
-    raw_phone = order.get('phone', '')
-    phone_display = format_phone_display(raw_phone)
-    
-    location = order.get('location')
-    location_text = ""
-    if location and ',' in str(location):
-        try:
-            lat, lng = str(location).split(',')
-            lat = float(lat.strip())
-            lng = float(lng.strip())
-            location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-        except:
-            pass
-    
-    status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
-    
-    message = f"""{status_text}
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {order.get('name')}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 Karta: {order.get('payme_card_mask', 'N/A')}
-🧾 Chek ID: {order.get('payme_receipt_id', 'N/A')}
-📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>⚡ To'lov muvaffaqiyatli! Buyurtmani qabul qiling yoki bekor qiling</i>"""
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
-            InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
-        ],
-        [
-            InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
-        ]
-    ]
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID_INT,
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-
-def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
-    """Foydalanuvchi profilini saqlash yoki yangilash"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            INSERT INTO users (tg_id, name, phone, username, updated_at)
-            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (tg_id) 
-            DO UPDATE SET 
-                name = EXCLUDED.name,
-                phone = EXCLUDED.phone,
-                username = EXCLUDED.username,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING *
-        """, (tg_id, name, phone, username))
-        
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        
-        logger.info(f"✅ Profil saqlandi: {tg_id} - {name} - {phone}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Profil saqlash xatosi: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
-    """Foydalanuvchi profilini olish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("SELECT * FROM users WHERE tg_id = %s", (tg_id,))
-        result = cur.fetchone()
-        cur.close()
-        
-        if result:
-            profile = dict(result)
-            for key in ['created_at', 'updated_at']:
-                if profile.get(key) and hasattr(profile[key], 'isoformat'):
-                    profile[key] = profile[key].isoformat()
-            return profile
-        return None
-        
-    except Exception as e:
-        logger.error(f"❌ Profil olish xatosi: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-
-
-def get_user_orders(tg_id: int) -> List[Dict[str, Any]]:
-    """Foydalanuvchining barcha buyurtmalarini olish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM orders 
-            WHERE tg_id = %s 
-            ORDER BY created_at DESC
-        """, (tg_id,))
-        results = cur.fetchall()
-        cur.close()
-        
-        orders = []
-        for row in results:
-            order_dict = dict(row)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            orders.append(order_dict)
-        
-        return orders
-        
-    except Exception as e:
-        logger.error(f"❌ Buyurtmalarni olish xatosi: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-def format_price(price: int) -> str:
-    return f"{price:,}".replace(",", " ")
-
-def format_phone_display(phone: str) -> str:
-    """Telefon raqamini ko'rsatish uchun formatlash"""
-    if not phone:
-        return "Noma'lum"
-    phone = ''.join(filter(str.isdigit, str(phone)))
-    if phone.startswith('998'):
-        phone = phone[3:]
-    phone = phone[-9:] if len(phone) > 9 else phone
-    return f"+998{phone}"
-
-# app.py - create_order funksiyasida TUZATISH
-def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        items = data.get('items', [])
-        if isinstance(items, list):
-            items_json = json.dumps(items)
-        else:
-            items_json = str(items) if items else '[]'
-
-        # ⭐⭐⭐ TO'G'RILANGAN tg_id olish
-        tg_id = None
-        try:
-            # 1. tgId yoki tg_id dan olish
-            tg_id_raw = data.get('tgId') or data.get('tg_id')
-            
-            # 2. Agar string bo'lsa va raqamli bo'lsa
-            if tg_id_raw and str(tg_id_raw).isdigit():
-                tg_id = int(tg_id_raw)
-                logger.info(f"✅ tg_id integer ga o'tkazildi: {tg_id}")
-            elif tg_id_raw:
-                # Agar 'tg_123' formatida bo'lsa
-                clean_id = str(tg_id_raw).replace('tg_', '').replace('user_', '')
-                if clean_id.isdigit():
-                    tg_id = int(clean_id)
-                    
-        except Exception as e:
-            logger.error(f"❌ tg_id conversion xatosi: {e}")
-            tg_id = None
-
-        # NULL uchun to'g'ri SQL
-        order_id = data.get('orderId')
-        name = data.get('name', 'Mijoz')
-        phone = data.get('phone', '000000000')
-        total = data.get('total', 0)
-        location = data.get('location')
-        source = data.get('source', 'website')
-        
-        logger.info(f"📋 INSERT: order_id={order_id}, tg_id={tg_id} (type: {type(tg_id)})")
-
-        cur.execute("""
-            INSERT INTO orders (
-                order_id, name, phone, items, total, 
-                status, payment_status, payment_method, 
-                location, tg_id, notified, created_at,
-                source
-            )
-            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING *
-        """, (
-            order_id, name, phone, items_json, total, 
-            'pending_payment', 'pending', 'payme',
-            location, tg_id, False, datetime.utcnow(),
-            source
-        ))
-
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-
-        if result:
-            order_dict = dict(result)
-            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            logger.info(f"✅ Buyurtma yaratildi: {order_dict.get('order_id')}")
-            return order_dict
-        return None
-
-    except Exception as e:
-        logger.error(f"❌ Create order ERROR: {e}")
-        import traceback
-        logger.error(traceback.format_exc())  # To'liq traceback
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[str, Any]]:
-    """Buyurtma statusini yangilash - tg_id ni saqlab qolish bilan"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Avval buyurtmani olish (tg_id ni saqlab qolish uchun)
-        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
-        existing = cur.fetchone()
-
-        if not existing:
-            logger.warning(f"⚠️ update_order_status: Buyurtma topilmadi: {order_id}")
-            return None
-
-        existing_dict = dict(existing)
-        existing_tg_id = existing_dict.get('tg_id')
-        logger.info(f"📊 Mavjud tg_id: {existing_tg_id}")
-
-        update_data = {'status': status}
-
-        # TIMESTAMP FIELDLAR
-        timestamp_fields = {
-            'accepted': 'accepted_at',
-            'rejected': 'rejected_at', 
-            'confirmed': 'confirmed_at',
-            'pending_payment': None,
-            'pending': None
-        }
-
-        if status in timestamp_fields and timestamp_fields[status]:
-            field_name = timestamp_fields[status]
-            update_data[field_name] = datetime.utcnow()
-
-        if status == 'confirmed':
-            update_data['accepted_at'] = datetime.utcnow()
-
-        if kwargs.get('paid_at'):
-            update_data['paid_at'] = kwargs.get('paid_at')
-
-        if 'notified' in kwargs:
-            update_data['notified'] = kwargs['notified']
-
-        # Boshqa parametrlarni qo'shish (tg_id ni update qilmaslik uchun tekshiramiz)
-        for key, val in kwargs.items():
-            if val is not None and key not in ['paid_at', 'notified', 'accepted_at', 'confirmed_at', 'rejected_at', 'tg_id']:
-                update_data[key] = val
-
-        # SQL query yaratish
-        fields = []
-        values = []
-        for key, val in update_data.items():
-            fields.append(f"{key} = %s")
-            values.append(val)
-        values.append(order_id)
-
-        query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s RETURNING *"
-        cur.execute(query, values)
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-
-        if result:
-            order_dict = dict(result)
-            # ⭐ MUHIM: Agar yangilangan order da tg_id yo'q bo'lsa, avvalgidan qayta tiklash
-            if not order_dict.get('tg_id') and existing_tg_id:
-                order_dict['tg_id'] = existing_tg_id
-                # Database ni ham yangilash
-                conn2 = get_db_connection()
-                cur2 = conn2.cursor()
-                cur2.execute("UPDATE orders SET tg_id = %s WHERE order_id = %s", (existing_tg_id, order_id))
-                conn2.commit()
-                cur2.close()
-                conn2.close()
-                logger.info(f"🔄 tg_id qayta tiklandi: {existing_tg_id}")
-
-            logger.info(f"✅ Buyurtma yangilandi: {order_id}, status: {status}, tg_id: {order_dict.get('tg_id')}")
-            return order_dict
-        return None
-
-    except Exception as e:
-        logger.error(f"Update error: {e}")
-        import traceback
-        traceback.print_exc()
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-async def get_order_handler(request):
-    try:
-        order_id = request.match_info['order_id']
-        order = get_order(order_id)
-        
-        if not order:
-            return web.json_response(
-                {"error": "Not found"}, 
-                status=404, 
-                headers=get_cors_headers()
-            )
-        
-        # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
-        response_data = {**order}
-        for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-            if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
-                response_data[key] = response_data[key].isoformat()
-        
-        return web.json_response(response_data, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"API get order error: {e}")
-        return web.json_response(
-            {"error": str(e)}, 
-            status=500, 
-            headers=get_cors_headers()
-        )
-
-async def notify_admin_payment_received(order: Dict, bot=None):
-    """
-    Admin ga yangi buyurtma haqida xabar (to'lov tekshirilmagan)
-    """
-    try:
-        logger.info(f"🔔 notify_admin_new_order: {order.get('order_id')}")
-
-        if not ADMIN_CHAT_ID_INT:
-            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
-            return False
-
-        if bot is None:
-            global application
-            if application and application.bot:
-                bot = application.bot
-            else:
-                logger.error("❌ Bot mavjud emas!")
-                return False
-
-        # Buyurtma ma'lumotlarini olish
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-
-        customer_name = order.get('name', 'Mijoz')
-        if not customer_name or customer_name == 'null':
-            customer_name = 'Mijoz'
-
-        location = order.get('location')
-        location_text = ""
-        location_coords = None
-
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-                location_coords = (lat, lng)
-            except Exception as e:
-                logger.warning(f"Joylashuv parse xatosi: {e}")
-                location_text = f"\n📍 <b>Manzil:</b> {location}"
-        elif location:
-            location_text = f"\n📍 <b>Manzil:</b> {location}"
-
-        source = order.get('source', 'website')
-        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
-
-        # ⭐ YANGI: To'lov kutilmoqda statusi
-        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
-
-        admin_message = f"""{status_text}
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {customer_name}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-📱 Manba: {source_icon}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
-
-        # ⭐⭐⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
-                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
-            ],
-            [
-                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
-            ]
-        ])
-
-        admin_sent = await bot.send_message(
-            chat_id=ADMIN_CHAT_ID_INT,
-            text=admin_message,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-        if location_coords and admin_sent:
-            try:
-                await bot.send_location(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    latitude=location_coords[0],
-                    longitude=location_coords[1]
-                )
-            except Exception as e:
-                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
-
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def get_cors_headers():
-    return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Max-Age': '86400',
-    }
-
-async def options_handler(request):
-    """CORS preflight so'rovlarini qaytarish"""
-    return web.Response(
-        status=200,
-        headers=get_cors_headers(),
-        body='{}'
-    )
-
-# ==========================================
-# TELEGRAM BOT FUNCTIONS
-# ==========================================
-
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Contact qabul qilish"""
     user = update.effective_user
@@ -1187,10 +703,8 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if phone.startswith('+'):
         phone = phone[1:]
-    
     if phone.startswith('998'):
         phone = phone[3:]
-    
     phone = phone[-9:] if len(phone) > 9 else phone
     
     success = save_user_profile(
@@ -1221,10 +735,286 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Barcha callback query larni qayta ishlash"""
+    query = update.callback_query
+    user = update.effective_user
+    
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.error(f"Query answer xatosi: {e}")
+    
+    data = query.data
+    logger.info(f"👆 Callback: {data} from {user.id}")
+    
+    # Statistika
+    if data == "admin_stats":
+        await show_stats(update, context)
+        return
+    
+    # Yangi buyurtmalar
+    if data == "show_new_orders":
+        await show_new_orders_list(update, context)
+        return
+    
+    # Payme guruhiga o'tish
+    if data.startswith("open_payme_group_"):
+        order_id = data.replace("open_payme_group_", "")
+        order = get_order(order_id)
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        group_link = f"https://t.me/{PAYME_GROUP_USERNAME}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
+            [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
+        ])
+        
+        await query.edit_message_text(
+            f"💳 <b>To'lovni tekshirish</b>\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
+            f"ORDER ID: <code>{order_id}</code>",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        return
+    
+    # Orqaga qaytish
+    if data.startswith("back_to_order_"):
+        order_id = data.replace("back_to_order_", "")
+        order = get_order(order_id)
+        if order:
+            await show_order_to_admin(update, context, order)
+        return
+    
+    # ⭐ YANGI: Tayyorlanish vaqti tanlash (inline buttons)
+    if data.startswith("prep_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            time_val = parts[1]
+            order_id = parts[2]
+            
+            if time_val == "custom":
+                # Custom vaqt uchun text so'rash (faqat shu holatda)
+                save_admin_state(user.id, 'awaiting_custom_time', order_id)
+                await query.edit_message_text(
+                    f"⏱ <b>#{order_id[-6:]}</b> uchun tayyorlanish vaqtini kiriting:\n"
+                    f"<i>Masalan: 25 daqiqa, 1 soat 15 daqiqa</i>",
+                    parse_mode='HTML'
+                )
+                return
+            else:
+                await process_accept_with_time(update, context, order_id, f"{time_val} daqiqa")
+        return
+    
+    # Bekor qilish
+    if data.startswith("cancel_accept_"):
+        order_id = data.replace("cancel_accept_", "")
+        clear_admin_state(user.id)
+        await query.edit_message_text(
+            "❌ <b>Qabul qilish bekor qilindi</b>",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Buyurtma qabul qilish (vaqt tanlash tugmalari ko'rsatish)
+    if data.startswith("accept_"):
+        order_id = data.replace("accept_", "")
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        if order.get('status') == 'accepted':
+            await query.answer("⚠️ Bu buyurtma allaqachon qabul qilingan!", show_alert=True)
+            return
+        
+        # ⭐ Database da state saqlash (context.user_data o'rniga)
+        save_admin_state(user.id, 'selecting_prep_time', order_id)
+        
+        # Tayyorlanish vaqti tugmalari
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("15 daqiqa", callback_data=f"prep_15_{order_id}"),
+                InlineKeyboardButton("30 daqiqa", callback_data=f"prep_30_{order_id}")
+            ],
+            [
+                InlineKeyboardButton("45 daqiqa", callback_data=f"prep_45_{order_id}"),
+                InlineKeyboardButton("60 daqiqa", callback_data=f"prep_60_{order_id}")
+            ],
+            [
+                InlineKeyboardButton("📝 Boshqa vaqt", callback_data=f"prep_custom_{order_id}")
+            ],
+            [
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_accept_{order_id}")
+            ]
+        ])
+        
+        phone_display = format_phone_display(order.get('phone', ''))
+        
+        await query.edit_message_text(
+            f"⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n"
+            f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
+            f"📞 Telefon: {phone_display}\n"
+            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
+            f"<b>Tayyorlanish vaqtini tanlang:</b>",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        return
+    
+    # Bekor qilish
+    if data.startswith("reject_"):
+        order_id = data.replace("reject_", "")
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        updated = update_order_status(order_id, 'rejected', rejected_at=datetime.utcnow())
+        
+        if updated:
+            await query.edit_message_text(
+                f"❌ <b>BUYURTMA BEKOR QILINDI</b>\n\n"
+                f"🆔 #{order_id[-6:]}\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode='HTML'
+            )
+            
+            # Mijoz ga xabar
+            tg_id = order.get('tg_id')
+            if tg_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(tg_id),
+                        text=f"❌ <b>Buyurtmangiz bekor qilindi</b>\n\n🆔 Buyurtma: #{order_id[-6:]}",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Mijozga bekor xabari yuborishda xato: {e}")
+        return
+
+async def process_accept_with_time(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str, prep_time: str):
+    """Buyurtma qabul qilish va mijozga xabar yuborish"""
+    query = update.callback_query
+    user = update.effective_user
+    
+    try:
+        order = get_order(order_id)
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            clear_admin_state(user.id)
+            return
+        
+        if order.get('status') == 'accepted':
+            await query.answer("Allaqachon qabul qilingan!", show_alert=True)
+            clear_admin_state(user.id)
+            return
+        
+        # Buyurtmani yangilash
+        updated = update_order_status(
+            order_id, 
+            'accepted',
+            admin_note=f"Tayyorlanish vaqti: {prep_time}",
+            accepted_at=datetime.utcnow()
+        )
+
+        if updated:
+            # Admin ga tasdiq
+            await query.edit_message_text(
+                f"✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
+                f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                f"⏱ Tayyorlanish vaqti: {prep_time}\n"
+                f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
+                f"📨 Mijozga xabar yuborilmoqda...",
+                parse_mode='HTML'
+            )
+            
+            # Mijozga xabar
+            notification_sent = await notify_customer_accepted(context.bot, updated, prep_time)
+            
+            if notification_sent:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=f"✅ Mijozga xabar yuborildi!\n\n🆔 #{order_id[-6:]}",
+                    parse_mode='HTML'
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=f"⚠️ Mijozga xabar yuborilmadi. Qo'lda xabar yuboring.\n\n🆔 #{order_id[-6:]}",
+                    parse_mode='HTML'
+                )
+        else:
+            await query.edit_message_text("❌ Xatolik yuz berdi!", parse_mode='HTML')
+            
+    except Exception as e:
+        logger.error(f"❌ Process accept xatosi: {e}")
+        await query.edit_message_text("❌ Xatolik yuz berdi!", parse_mode='HTML')
+    finally:
+        clear_admin_state(user.id)
+
+async def show_order_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, order: Dict):
+    """Buyurtma ma'lumotlarini admin ga ko'rsatish"""
+    items = order.get('items', [])
+    if isinstance(items, str):
+        items = json.loads(items)
+    
+    items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+    phone_display = format_phone_display(order.get('phone', ''))
+    
+    location = order.get('location')
+    location_text = ""
+    if location and ',' in str(location):
+        try:
+            lat, lng = str(location).split(',')
+            location_text = f"\n📍 <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+        except:
+            pass
+    
+    status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
+    
+    message = f"""{status_text}
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
+            InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+        ],
+        [
+            InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
+        ]
+    ]
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
     else:
-        await update.message.reply_text(
-            "❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.",
-            reply_markup=ReplyKeyboardRemove(),
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID_INT,
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
 
@@ -1238,12 +1028,12 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Yangi buyurtmalar: pending_payment statusida
         cur.execute("""
             SELECT * FROM orders 
             WHERE status IN ('pending_payment', 'pending')
             AND created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
             ORDER BY created_at DESC
+            LIMIT 10
         """)
         results = cur.fetchall()
         cur.close()
@@ -1255,634 +1045,28 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
             new_orders.append(order_dict)
-        
+            
     except Exception as e:
         logger.error(f"❌ Yangi buyurtmalarni olish xatosi: {e}")
         new_orders = []
     finally:
-        if conn:
-            conn.close()
+        put_db_connection(conn)
     
-    # Agar yangi buyurtma bo'lmasa
     if not new_orders:
         await query.edit_message_text(
-            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>\n\n"
-            "Yangi buyurtmalar kelganda bu yerda ko'rinadi.",
+            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>",
             parse_mode='HTML'
         )
         return
     
-    # Har bir buyurtma uchun xabar yuborish
+    # Har bir buyurtma uchun alohida xabar
     for order in new_orders:
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-        
-        location = order.get('location')
-        location_text = ""
-        location_coords = None
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-                location_coords = (lat, lng)
-            except:
-                pass
-        
-        message = f"""🛎️ <b>YANGI BUYURTMA!</b>
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {order.get('name')}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: Kutilmoqda{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {order.get('created_at', datetime.now().isoformat())[:19]}
-
-<i>⏳ To'lovni tekshiring va buyurtmani qabul qiling</i>"""
-
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
-                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
-            ],
-            [
-                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
-            ]
-        ]
-        
-        sent_message = await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        
-        if location_coords:
-            try:
-                await context.bot.send_location(
-                    chat_id=update.effective_user.id,
-                    latitude=location_coords[0],
-                    longitude=location_coords[1],
-                    reply_to_message_id=sent_message.message_id
-                )
-            except Exception as e:
-                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
+        await show_order_to_admin(update, context, order)
     
-    # Asosiy xabarni yangilash
     await query.edit_message_text(
-        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.\n"
-        f"⏳ Ularni qabul qilish yoki bekor qilish mumkin.",
+        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.",
         parse_mode='HTML'
     )
-
-def get_order(order_id: str) -> Optional[Dict[str, Any]]:
-    """Buyurtmani olish - CASE INSENSITIVE va to'liq ma'lumot bilan"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # CASE INSENSITIVE qidirish - ILIKE ishlatamiz
-        cur.execute(
-            "SELECT * FROM orders WHERE order_id ILIKE %s", 
-            (order_id,)
-        )
-        result = cur.fetchone()
-        cur.close()
-
-        if result:
-            order_dict = dict(result)
-
-            # ⭐ tg_id ni tekshirish va log qilish
-            tg_id = order_dict.get('tg_id')
-            logger.info(f"📋 get_order: {order_id}, tg_id: {tg_id}")
-
-            # Timestamp larni formatlash
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            return order_dict
-        return None
-
-    except Exception as e:
-        logger.error(f"Get order error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-
-async def get_categories_handler(request):
-    """Kategoriyalarni olish - DATABASE dan"""
-    try:
-        categories = get_categories_from_db()
-        
-        # Agar bo'sh bo'lsa, default categories ni qaytarish va saqlash
-        if not categories:
-            logger.warning("⚠️ Categories bo'sh, default qaytarilmoqda")
-            categories = [
-                {"id": "all", "name": "Все", "icon": "🍽", "sortOrder": 0},
-                {"id": "salad", "name": "Салаты", "icon": "🥗", "sortOrder": 1},
-                {"id": "soup", "name": "Супы", "icon": "🍜", "sortOrder": 2},
-                {"id": "bread", "name": "Хлеб", "icon": "🍞", "sortOrder": 3},
-                {"id": "pide", "name": "Пиде", "icon": "🫓", "sortOrder": 4},
-                {"id": "pizza", "name": "Пицца", "icon": "🍕", "sortOrder": 5},
-                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔", "sortOrder": 6},
-                {"id": "fish", "name": "Рыба", "icon": "🐟", "sortOrder": 7},
-                {"id": "main", "name": "Основные блюда", "icon": "🍖", "sortOrder": 8},
-                {"id": "side", "name": "Гарниры", "icon": "🍟", "sortOrder": 9},
-                {"id": "dessert", "name": "Десерты", "icon": "🍰", "sortOrder": 10},
-                {"id": "fruit", "name": "Фрукты", "icon": "🍇", "sortOrder": 11},
-                {"id": "drink", "name": "Напитки", "icon": "🥤", "sortOrder": 12}
-            ]
-            save_categories_to_db(categories)
-        
-        return web.json_response({
-            "success": True,
-            "categories": categories,
-            "count": len(categories),
-            "timestamp": datetime.utcnow().isoformat(),
-            "server_time": datetime.utcnow().isoformat()
-        }, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"❌ Get categories error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        # Xatolik bo'lsa ham default qaytarish
-        return web.json_response({
-            "success": True,  # Muhim: success=True qilish
-            "categories": [
-                {"id": "all", "name": "Все", "icon": "🍽", "sortOrder": 0},
-                {"id": "salad", "name": "Салаты", "icon": "🥗", "sortOrder": 1},
-                {"id": "soup", "name": "Супы", "icon": "🍜", "sortOrder": 2},
-                {"id": "bread", "name": "Хлеб", "icon": "🍞", "sortOrder": 3},
-                {"id": "pide", "name": "Пиде", "icon": "🫓", "sortOrder": 4},
-                {"id": "pizza", "name": "Пицца", "icon": "🍕", "sortOrder": 5},
-                {"id": "sandwich", "name": "Сендвич/Бургер", "icon": "🍔", "sortOrder": 6},
-                {"id": "fish", "name": "Рыба", "icon": "🐟", "sortOrder": 7},
-                {"id": "main", "name": "Основные блюда", "icon": "🍖", "sortOrder": 8},
-                {"id": "side", "name": "Гарниры", "icon": "🍟", "sortOrder": 9},
-                {"id": "dessert", "name": "Десерты", "icon": "🍰", "sortOrder": 10},
-                {"id": "fruit", "name": "Фрукты", "icon": "🍇", "sortOrder": 11},
-                {"id": "drink", "name": "Напитки", "icon": "🥤", "sortOrder": 12}
-            ],
-            "count": 13,
-            "error": str(e)  # Xato haqida ma'lumot
-        }, headers=get_cors_headers())
-
-
-async def prep_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin tayyorlanish vaqtini kiritganda ishga tushadi.
-    """
-    user = update.effective_user
-
-    # Faqat admin uchun tekshiruv
-    if user.id != ADMIN_CHAT_ID_INT:
-        return
-
-    # Kutilayotgan state mavjudmi tekshirish
-    if not context.user_data.get('awaiting_prep_time'):
-        return
-
-    order_id = context.user_data.get('accepting_order_id')
-    prep_time = update.message.text.strip()
-
-    if not order_id:
-        await update.message.reply_text("❌ Xatolik: Buyurtma ID topilmadi!")
-        context.user_data.pop('awaiting_prep_time', None)
-        context.user_data.pop('accepting_order_id', None)
-        return
-
-    # Buyurtma ma'lumotlarini olish
-    order = get_order(order_id)
-    if not order:
-        await update.message.reply_text("❌ Xatolik: Buyurtma topilmadi!")
-        context.user_data.pop('awaiting_prep_time', None)
-        context.user_data.pop('accepting_order_id', None)
-        return
-
-    # Allaqachon qabul qilinganmi tekshirish
-    if order.get('status') == 'accepted':
-        await update.message.reply_text("⚠️ Bu buyurtma allaqachon qabul qilingan!")
-        context.user_data.pop('awaiting_prep_time', None)
-        context.user_data.pop('accepting_order_id', None)
-        return
-
-    try:
-        # ⭐ MUHIM: Avvalgi tg_id ni saqlab qolish
-        existing_tg_id = order.get('tg_id')
-        logger.info(f"📋 prep_time_handler: Mavjud tg_id = {existing_tg_id}")
-
-        # Buyurtma statusini yangilash
-        updated_order = update_order_status(
-            order_id, 
-            'accepted',
-            admin_note=f"Tayyorlanish vaqti: {prep_time}",
-            accepted_at=datetime.utcnow()
-        )
-
-        if updated_order:
-            # ⭐ MUHIM: Yangilangan order dan tg_id ni olish yoki avvalgidan tiklash
-            final_tg_id = updated_order.get('tg_id') or existing_tg_id
-            updated_order['tg_id'] = final_tg_id
-            
-            logger.info(f"📋 Final tg_id: {final_tg_id}")
-
-            # Admin ga tasdiqlash
-            admin_confirm_msg = (
-                "✅ <b>BUYURTMA QABUL QILINDI</b>\n\n"
-                f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
-                f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
-                f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-                f"📱 tg_id: {final_tg_id}\n"
-                "📨 Mijozga xabar yuborilmoqda..."
-            )
-            await update.message.reply_text(admin_confirm_msg, parse_mode='HTML')
-
-            # ⭐⭐⭐ MIJOZGA XABAR YUBORISH
-            notification_sent = await notify_customer_accepted(context.bot, updated_order, prep_time)
-
-            if notification_sent:
-                await update.message.reply_text("✅ Mijozga xabar yuborildi!")
-            else:
-                await update.message.reply_text(
-                    "⚠️ <b>Diqqat!</b>\n"
-                    "Mijozga xabar yuborilmadi. Iltimos, qo'lda xabar yuboring.",
-                    parse_mode='HTML'
-                )
-        else:
-            await update.message.reply_text(
-                "❌ <b>Xatolik!</b>\nBuyurtma ma'lumotlar bazasida yangilanmadi.",
-                parse_mode='HTML'
-            )
-
-    except Exception as e:
-        logger.error(f"❌ Buyurtma qabul qilishda xato: {e}")
-        import traceback
-        traceback.print_exc()
-        await update.message.reply_text(
-            "❌ <b>Kutilmagan xatolik yuz berdi!</b>\nIltimos, qayta urinib ko'ring.",
-            parse_mode='HTML'
-        )
-
-    finally:
-        # State ni tozalash
-        context.user_data.pop('awaiting_prep_time', None)
-        context.user_data.pop('accepting_order_id', None)
-
-async def notify_customer_accepted(bot, order: Dict, prep_time: str):
-    """
-    Buyurtma qabul qilinganda mijozga xabar yuboradi.
-    Tayyorlanish vaqti bilan birga yuboriladi.
-    """
-    # ⭐ MUHIM: Bir nechta yo'l bilan tg_id ni olish
-    tg_id = order.get('tg_id') or order.get('tgId') or order.get('user_id')
-    
-    # String bo'lsa, int ga o'tkazish
-    if tg_id and isinstance(tg_id, str):
-        try:
-            tg_id = int(tg_id)
-        except ValueError:
-            tg_id = None
-    
-    if not tg_id or tg_id == 0:
-        logger.warning(f"⚠️ Mijoz tg_id yo'q: {order.get('order_id')}")
-        return False
-    
-    try:
-        # Xabar matnini tayyorlash
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        if items:
-            items_short = ", ".join([f"{i.get('name')} x{i.get('qty')}" for i in items[:3]])
-            if len(items) > 3:
-                items_short += f" va yana {len(items)-3} ta"
-        else:
-            items_short = "Ma'lumot yo'q"
-        
-        current_time = datetime.now().strftime('%H:%M')
-        order_id_short = str(order.get('order_id', 'N/A'))[-6:]
-        total_price = format_price(order.get('total', 0))
-        
-        customer_message = (
-            "🎉 <b>Buyurtmangiz qabul qilindi!</b>\n\n"
-            f"🆔 <b>Buyurtma raqami:</b> #{order_id_short}\n"
-            f"⏱ <b>Tayyorlanish vaqti:</b> {prep_time}\n"
-            f"💵 <b>Summa:</b> {total_price} so'm\n\n"
-            f"🍽 <b>Buyurtma:</b> {items_short}\n\n"
-            "👨‍🍳 Oshxonada tayyorlanmoqda...\n"
-            "🚚 Tayyor bo'lganda yetkazib beramiz!\n\n"
-            "📞 Savollar bo'yicha: +998882015020\n"
-            f"⏰ {current_time}"
-        )
-        
-        # Mijozga xabar yuborish
-        await bot.send_message(
-            chat_id=int(tg_id),
-            text=customer_message,
-            parse_mode='HTML'
-        )
-        
-        logger.info(f"✅ Mijozga qabul xabari yuborildi: {tg_id}, vaqt: {prep_time}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Mijozga xabar yuborishda xato: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Barcha callback query larni qayta ishlash.
-    """
-    query = update.callback_query
-    user = update.effective_user
-    
-    # Har doim callback query ga javob qaytarish
-    try:
-        await query.answer()
-    except Exception as e:
-        logger.error(f"Query answer xatosi: {e}")
-    
-    data = query.data
-    logger.info(f"👆 Callback query: {data} from admin: {user.id}")
-    
-    # === TAYYORLANISH VAQTI KUTILMOQDA (Bekor qilish) ===
-    if data.startswith("cancel_accept_"):
-        order_id = data.replace("cancel_accept_", "")
-        
-        # State ni tekshirish
-        if (context.user_data.get('awaiting_prep_time') and 
-            context.user_data.get('accepting_order_id') == order_id):
-            
-            context.user_data.pop('awaiting_prep_time', None)
-            context.user_data.pop('accepting_order_id', None)
-            
-            await query.edit_message_text(
-                "❌ <b>Qabul qilish bekor qilindi</b>\n\n"
-                "Yangi buyurtmalarni ko'rish uchun /start ni bosing.",
-                parse_mode='HTML'
-            )
-            return
-    
-    # === STATISTIKA ===
-    if data == "admin_stats":
-        await show_stats(update, context)
-        return
-    
-    # === YANGI BUYURTMALAR RO'YXATI ===
-    if data == "show_new_orders":
-        await show_new_orders_list(update, context)
-        return
-    
-    # === PAYME GURUHIGA O'TISH ===
-    if data.startswith("open_payme_group_"):
-        order_id = data.replace("open_payme_group_", "")
-        order = get_order(order_id)
-        
-        if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
-            return
-        
-        payme_group_username = os.getenv("PAYME_GROUP_USERNAME", "bodrumbota")
-        group_link = f"https://t.me/{payme_group_username}"
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
-            [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
-        ])
-        
-        await query.edit_message_text(
-            "💳 <b>To'lovni tekshirish</b>\n\n"
-            f"🆔 Buyurtma: #{order_id[-6:]}\n"
-            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-            "Quyidagi ORDER ID ni Payme guruhida qidiring:\n"
-            f"<code>{order_id}</code>\n\n"
-            "To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        return
-    
-    # === ORQAGA QAYTISH ===
-    if data.startswith("back_to_order_"):
-        order_id = data.replace("back_to_order_", "")
-        order = get_order(order_id)
-        
-        if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
-            return
-        
-        # Buyurtma ma'lumotlarini qayta ko'rsatish
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        phone_display = format_phone_display(order.get('phone', ''))
-        
-        order_id_val = order.get('order_id', 'N/A')
-        customer_name = order.get('name', 'Mijoz')
-        total_val = order.get('total', 0)
-        
-        location_text = ""
-        location = order.get('location')
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-            except:
-                pass
-        
-        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
-        
-        message = (
-            f"{status_text}\n\n"
-            f"🆔 Buyurtma: #{order_id_val[-6:]}\n"
-            f"👤 Mijoz: {customer_name}\n"
-            f"📞 Telefon: {phone_display}\n"
-            f"💵 Summa: {format_price(total_val)} so'm"
-            f"{location_text}\n\n"
-            f"🍽 Mahsulotlar:\n{items_text}\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order_id}"),
-                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order_id}")
-            ],
-            [
-                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order_id}")
-            ]
-        ])
-        
-        await query.edit_message_text(message, reply_markup=keyboard, parse_mode='HTML')
-        return
-    
-    # === BUYURTMANI QABUL QILISH (Vaqt so'rash) ===
-    if data.startswith("accept_"):
-        order_id = data.replace("accept_", "")
-        order = get_order(order_id)
-        
-        if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
-            return
-        
-        # Allaqachon qabul qilinganmi?
-        if order.get('status') == 'accepted':
-            await query.answer("⚠️ Bu buyurtma allaqachon qabul qilingan!", show_alert=True)
-            return
-        
-        # State saqlash
-        context.user_data['awaiting_prep_time'] = True
-        context.user_data['accepting_order_id'] = order_id
-        
-        # Vaqt kiritish uchun so'rov
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        
-        # ⭐⭐⭐ YANGI: Telefon raqamini olish
-        phone_display = format_phone_display(order.get('phone', ''))
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_accept_{order_id}")]
-        ])
-        
-        # ⭐⭐⭐ YANGI: Telefon raqami qo'shildi
-        prompt_message = (
-            "⏱ <b>BUYURTMANI QABUL QILISH</b>\n\n"
-            f"🆔 Buyurtma: #{order_id[-6:]}\n"
-            f"👤 Mijoz: {order.get('name', 'Mijoz')}\n"
-            f"📞 <b>Telefon:</b> {phone_display}\n"  # ⭐ Telefon qo'shildi
-            f"💵 Summa: {format_price(order.get('total', 0))} so'm\n\n"
-            f"🍽 Mahsulotlar:\n{items_text}\n\n"
-            "✍️ <b>Tayyorlanish vaqtini kiriting:</b>\n"
-            "<i>Masalan:</i> <code>20 daqiqa</code>, <code>30-40 daqiqa</code>, <code>1 soat</code>"
-        )
-        
-        await query.edit_message_text(
-            prompt_message,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        return
-    
-    # === BUYURTMANI BEKOR QILISH ===
-    if data.startswith("reject_"):
-        action, order_id = data.split("_", 1)
-        order = get_order(order_id)
-        
-        if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
-            return
-        
-        # Status ni rejected ga o'zgartirish
-        updated = update_order_status(order_id, 'rejected', rejected_at=datetime.utcnow())
-        
-        if updated:
-            current_time = datetime.now().strftime('%H:%M:%S')
-            # Admin ga tasdiq
-            await query.edit_message_text(
-                "❌ <b>BUYURTMA BEKOR QILINDI</b>\n\n"
-                f"🆔 #{order_id[-6:]}\n"
-                f"👤 {order.get('name', 'Mijoz')}\n"
-                f"⏰ {current_time}",
-                parse_mode='HTML'
-            )
-            
-            # Mijoz ga xabar
-            tg_id = order.get('tg_id')
-            if tg_id and str(tg_id) not in ['0', 'None', '', 'null']:
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(tg_id),
-                        text=(
-                            "❌ <b>Buyurtmangiz bekor qilindi</b>\n\n"
-                            f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                            "📞 Qo'llab-quvvatlash: +998901234567"
-                        ),
-                        parse_mode='HTML'
-                    )
-                except Exception as e:
-                    logger.error(f"Mijozga bekor xabari yuborishda xato: {e}")
-        else:
-            await query.edit_message_text("❌ Xatolik yuz berdi!")
-        
-        return
-    
-    # === BUYURTMANI TASDIQLASH (Confirm) ===
-    if data.startswith("confirm_"):
-        action, order_id = data.split("_", 1)
-        order = get_order(order_id)
-        
-        if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
-            return
-        
-        updated = update_order_status(order_id, 'confirmed', confirmed_at=datetime.utcnow())
-        
-        if updated:
-            current_time = datetime.now().strftime('%H:%M:%S')
-            await query.edit_message_text(
-                "✅✅ <b>BUYURTMA TASDIQLANDI</b>\n\n"
-                f"🆔 #{order_id[-6:]}\n"
-                f"⏰ {current_time}",
-                parse_mode='HTML'
-            )
-            
-            # Mijoz ga xabar
-            tg_id = order.get('tg_id')
-            if tg_id and str(tg_id) not in ['0', 'None', '', 'null']:
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(tg_id),
-                        text=(
-                            "✅✅ <b>Buyurtmangiz tayyor!</b>\n\n"
-                            f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                            "🚚 Tez orada yetkazib beramiz!"
-                        ),
-                        parse_mode='HTML'
-                    )
-                except Exception as e:
-                    logger.error(f"Mijozga tasdiq xabari yuborishda xato: {e}")
-        else:
-            await query.edit_message_text("❌ Xatolik yuz berdi!")
-        
-        return
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Statistika ko'rsatish"""
-    user = update.effective_user
-    
-    if user.id != ADMIN_CHAT_ID_INT:
-        await update.message.reply_text("❌ Siz admin emassiz!")
-        return
-    
-    await show_stats(update, context)
-
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Statistikani ko'rsatish"""
@@ -1897,31 +1081,34 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT COUNT(*) FROM orders WHERE status IN ('pending', 'pending_payment')")
         new_count = cur.fetchone()['count']
         
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE status = 'accepted' AND DATE(accepted_at) = %s", (today,))
+        cur.execute("""
+            SELECT COUNT(*), COALESCE(SUM(total), 0) 
+            FROM orders 
+            WHERE status = 'accepted' AND DATE(accepted_at) = %s
+        """, (today,))
         today_result = cur.fetchone()
-        today_count = today_result['count']
-        today_sum = today_result['coalesce'] or 0
         
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE status = 'accepted'")
+        cur.execute("""
+            SELECT COUNT(*), COALESCE(SUM(total), 0) 
+            FROM orders 
+            WHERE status = 'accepted'
+        """)
         total_result = cur.fetchone()
-        total_count = total_result['count']
-        total_sum = total_result['coalesce'] or 0
         
         cur.close()
-        conn.close()
         
         stats_text = f"""📊 <b>STATISTIKA</b>
 
 🕐 <b>Bugun ({today}):</b>
-• Buyurtmalar: {today_count} ta
-• Summa: {format_price(today_sum)} so'm
+• Buyurtmalar: {today_result['count']} ta
+• Summa: {format_price(today_result['coalesce'])} so'm
 
 ⏳ <b>Kutilayotgan:</b>
-• Yangi buyurtmalar: {new_count} ta
+• Yangi: {new_count} ta
 
 📈 <b>Jami:</b>
-• Qabul qilingan: {total_count} ta
-• Umumiy summa: {format_price(total_sum)} so'm
+• Qabul qilingan: {total_result['count']} ta
+• Umumiy: {format_price(total_result['coalesce'])} so'm
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
         
@@ -1942,7 +1129,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
             )
-        
+            
     except Exception as e:
         logger.error(f"Stats error: {e}")
         text = "❌ Statistikani olishda xatolik"
@@ -1950,16 +1137,48 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.edit_message_text(text)
         else:
             await update.message.reply_text(text)
+    finally:
+        put_db_connection(conn)
 
+# ==========================================
+# API HANDLERS
+# ==========================================
 async def health_handler(request):
-    return web.json_response({
-        "status": "ok", 
+    """Kengaytirilgan health check"""
+    status = {
+        "status": "ok",
         "service": "bodrum-bot",
         "timestamp": datetime.utcnow().isoformat(),
-        "payme_receipt_parser": "enabled",
-        "auto_accept": "enabled",
-        "payme_group_id": PAYME_GROUP_ID_INT
-    }, headers=get_cors_headers())
+        "webhook_url": WEBHOOK_URL,
+        "admin_id": ADMIN_CHAT_ID_INT
+    }
+    
+    # Database tekshiruvi
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        put_db_connection(conn)
+        status["database"] = "connected"
+    except Exception as e:
+        status["database"] = f"error: {str(e)}"
+        status["status"] = "degraded"
+    
+    # Webhook tekshiruvi
+    global application
+    if application and application.bot:
+        try:
+            webhook_info = await application.bot.get_webhook_info()
+            status["webhook"] = {
+                "url": webhook_info.url,
+                "pending_updates": webhook_info.pending_update_count
+            }
+        except Exception as e:
+            status["webhook"] = f"error: {str(e)}"
+    
+    return web.json_response(status, headers=get_cors_headers())
 
 async def create_order_handler(request):
     try:
@@ -1974,204 +1193,32 @@ async def create_order_handler(request):
         order = create_order(data)
         
         if order:
-            logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
+            # Admin ga xabar yuborish
+            asyncio.create_task(notify_admin_new_order(order))
             
-            # ⭐⭐⭐ DARHOL ADMINGA XABAR YUBORISH (TO'G'RI FUNKSIYA)
-            try:
-                # ASINXRON XABAR YUBORISH - notify_admin_new_order chaqiriladi
-                asyncio.create_task(notify_admin_new_order(order))
-                logger.info(f"📨 Admin ga xabar yuborildi: {order['order_id']}")
-            except Exception as e:
-                logger.error(f"❌ Admin ga xabar yuborish xatosi: {e}")
-            
-            # Payme URL ni qaytarish
             payme_url = f"https://checkout.payme.uz/{os.getenv('PAYME_MERCHANT_ID')}?orderId={order['order_id']}&amount={order['total'] * 100}"
             
-            # ⭐⭐⭐ MUHIM: datetime obyektlarini JSON serializable qilish
             response_data = {**order}
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
                     response_data[key] = response_data[key].isoformat()
             
-            response_data["message"] = "Buyurtma yaratildi. To'lovni amalga oshiring."
             response_data["payme_url"] = payme_url
             
-            return web.json_response(
-                response_data,
-                status=201, 
-                headers=get_cors_headers()
-            )
+            return web.json_response(response_data, status=201, headers=get_cors_headers())
         else:
-            return web.json_response(
-                {"error": "Failed to create order"}, 
-                status=500, 
-                headers=get_cors_headers()
-            )
+            return web.json_response({"error": "Failed to create order"}, status=500, headers=get_cors_headers())
         
     except Exception as e:
         logger.error(f"API create order error: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response(
-            {"error": str(e)}, 
-            status=500, 
-            headers=get_cors_headers()
-        )
-
-async def notify_admin_new_order(order: Dict):
-    """
-    Admin ga YANGI BUYURTMA haqida xabar (to'lov tekshirilmagan)
-    """
-    try:
-        logger.info(f"🔔 Yangi buyurtma admin ga: {order.get('order_id')}")
-
-        if not ADMIN_CHAT_ID_INT:
-            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
-            return False
-
-        global application
-        if not application or not application.bot:
-            logger.error("❌ Bot mavjud emas!")
-            return False
-        
-        bot = application.bot
-
-        # Buyurtma ma'lumotlarini olish
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-
-        customer_name = order.get('name', 'Mijoz')
-        if not customer_name or customer_name == 'null':
-            customer_name = 'Mijoz'
-
-        location = order.get('location')
-        location_text = ""
-        location_coords = None
-
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-                location_coords = (lat, lng)
-            except Exception as e:
-                logger.warning(f"Joylashuv parse xatosi: {e}")
-                location_text = f"\n📍 <b>Manzil:</b> {location}"
-        elif location:
-            location_text = f"\n📍 <b>Manzil:</b> {location}"
-
-        source = order.get('source', 'website')
-        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
-
-        # ⭐ YANGI: To'lov kutilmoqda statusi
-        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
-
-        admin_message = f"""{status_text}
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {customer_name}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-📱 Manba: {source_icon}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
-
-        # ⭐⭐⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
-                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
-            ],
-            [
-                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
-            ]
-        ])
-
-        admin_sent = await bot.send_message(
-            chat_id=ADMIN_CHAT_ID_INT,
-            text=admin_message,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-        if location_coords and admin_sent:
-            try:
-                await bot.send_location(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    latitude=location_coords[0],
-                    longitude=location_coords[1]
-                )
-            except Exception as e:
-                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
-
-        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-async def update_order_handler(request):
-    """Buyurtma yangilash"""
-    try:
-        order_id = request.match_info['order_id']
-        data = await request.json()
-        
-        status = data.get('status')
-        payment_status = data.get('paymentStatus')
-        admin_note = data.get('adminNote')
-        
-        updated = update_order_status(
-            order_id, 
-            status, 
-            payment_status=payment_status,
-            admin_note=admin_note
-        )
-        
-        if updated:
-            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
-            response_data = {**updated}
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
-                    response_data[key] = response_data[key].isoformat()
-            
-            return web.json_response(response_data, headers=get_cors_headers())
-        else:
-            return web.json_response(
-                {"error": "Order not found"}, 
-                status=404, 
-                headers=get_cors_headers()
-            )
-            
-    except Exception as e:
-        logger.error(f"Update order error: {e}")
-        return web.json_response(
-            {"error": str(e)}, 
-            status=500, 
-            headers=get_cors_headers()
-        )
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
-    """Barcha buyurtmalarni olish - BARCHA STATUSLAR"""
+    """Barcha buyurtmalarni olish"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # ⭐⭐⭐ BARCHA STATUSLARNI OLIB QAYTARISH (filtr olib tashlandi)
         cur.execute("""
             SELECT * FROM orders 
             ORDER BY 
@@ -2188,12 +1235,10 @@ async def orders_list_handler(request):
         """)
         results = cur.fetchall()
         cur.close()
-        conn.close()
         
         orders = []
         for row in results:
             order_dict = dict(row)
-            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -2203,11 +1248,9 @@ async def orders_list_handler(request):
         
     except Exception as e:
         logger.error(f"Orders list error: {e}")
-        return web.json_response(
-            {"error": str(e)}, 
-            status=500, 
-            headers=get_cors_headers()
-        )
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+    finally:
+        put_db_connection(conn)
 
 async def new_orders_handler(request):
     """Yangi buyurtmalarni olish"""
@@ -2216,17 +1259,15 @@ async def new_orders_handler(request):
         cur = conn.cursor()
         cur.execute("""
             SELECT * FROM orders 
-            WHERE status IN ('pending', 'pending_payment', 'payment_pending') 
+            WHERE status IN ('pending', 'pending_payment') 
             ORDER BY created_at DESC
         """)
         results = cur.fetchall()
         cur.close()
-        conn.close()
         
         orders = []
         for row in results:
             order_dict = dict(row)
-            # ⭐⭐⭐ MUHIM: datetime obyektlarini string ga aylantirish
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -2236,31 +1277,43 @@ async def new_orders_handler(request):
         
     except Exception as e:
         logger.error(f"New orders error: {e}")
-        return web.json_response(
-            {"error": str(e)}, 
-            status=500, 
-            headers=get_cors_headers()
-        )
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+    finally:
+        put_db_connection(conn)
+
+async def get_order_handler(request):
+    try:
+        order_id = request.match_info['order_id']
+        order = get_order(order_id)
+        
+        if not order:
+            return web.json_response({"error": "Not found"}, status=404, headers=get_cors_headers())
+        
+        response_data = {**order}
+        for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+            if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
+                response_data[key] = response_data[key].isoformat()  # ✅ To'g'ri
+        
+        return web.json_response(response_data, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"API get order error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def update_order_handler(request):
-    """Buyurtma yangilash"""
     try:
         order_id = request.match_info['order_id']
         data = await request.json()
         
         status = data.get('status')
-        payment_status = data.get('paymentStatus')
-        admin_note = data.get('adminNote')
-        
-        updated = update_order_status(
-            order_id, 
-            status, 
-            payment_status=payment_status,
-            admin_note=admin_note
-        )
+        updated = update_order_status(order_id, status)
         
         if updated:
-            return web.json_response(updated, headers=get_cors_headers())
+            response_data = {**updated}
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if response_data.get(key) and hasattr(response_data[key], 'isoformat'):
+                    response_data[key] = response_data[key].isoformat()
+            return web.json_response(response_data, headers=get_cors_headers())
         else:
             return web.json_response({"error": "Order not found"}, status=404, headers=get_cors_headers())
             
@@ -2268,130 +1321,15 @@ async def update_order_handler(request):
         logger.error(f"Update order error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-async def save_user_profile_api(request):
-    """Foydalanuvchi profilini saqlash"""
-    try:
-        data = await request.json()
-        tg_id_raw = data.get('tgId')
-        name = data.get('name', 'Foydalanuvchi')
-        phone = data.get('phone', '')
-        username = data.get('username', '')
-        
-        print(f"💾 Profil saqlanmoqda: tg_id={tg_id_raw}, name={name}, phone={phone}")
-        
-        if not tg_id_raw:
-            return web.json_response({
-                "success": False,
-                "error": "tgId required"
-            }, status=400, headers=get_cors_headers())
-        
-        try:
-            tg_id = int(tg_id_raw)
-        except (ValueError, TypeError):
-            return web.json_response({
-                "success": False,
-                "error": "Invalid tgId format"
-            }, status=400, headers=get_cors_headers())
-        
-        if not phone or len(phone) != 9:
-            return web.json_response({
-                "success": False,
-                "error": "Valid phone required (9 digits)"
-            }, status=400, headers=get_cors_headers())
-        
-        success = save_user_profile(tg_id, name, phone, username)
-        
-        if success:
-            profile = get_user_profile(tg_id)
-            orders = get_user_orders(tg_id)
-            
-            return web.json_response({
-                "success": True,
-                "profile": profile,
-                "orders": orders
-            }, headers=get_cors_headers())
-        else:
-            return web.json_response({
-                "success": False,
-                "error": "Failed to save profile"
-            }, status=500, headers=get_cors_headers())
-            
-    except Exception as e:
-        logger.error(f"Save user profile API error: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
-async def get_user_profile_api(request):
-    """Foydalanuvchi profilini olish"""
-    try:
-        data = await request.json()
-        tg_id_raw = data.get('tgId')
-        
-        print(f"🔍 API: Profil so'raldi, raw tg_id: {tg_id_raw}, type: {type(tg_id_raw)}")
-        
-        if not tg_id_raw:
-            return web.json_response({
-                "success": False, 
-                "error": "tgId required"
-            }, status=400, headers=get_cors_headers())
-        
-        try:
-            tg_id = int(tg_id_raw)
-        except (ValueError, TypeError) as e:
-            print(f"❌ tgId conversion error: {e}")
-            return web.json_response({
-                "success": False,
-                "error": "Invalid tgId format"
-            }, status=400, headers=get_cors_headers())
-        
-        profile = get_user_profile(tg_id)
-        orders = get_user_orders(tg_id)
-        
-        # ⭐⭐⭐ MUHIM: orders dagi datetime obyektlarini string ga aylantirish
-        if orders:
-            for order in orders:
-                for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                    if order.get(key) and hasattr(order[key], 'isoformat'):
-                        order[key] = order[key].isoformat()
-        
-        # Profile dagi datetime larni ham aylantirish
-        if profile:
-            for key in ['created_at', 'updated_at']:
-                if profile.get(key) and hasattr(profile[key], 'isoformat'):
-                    profile[key] = profile[key].isoformat()
-        
-        print(f"✅ API: Profil: {profile is not None}, Buyurtmalar: {len(orders)}")
-        
-        return web.json_response({
-            "success": True,
-            "profile": profile,
-            "orders": orders
-        }, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"Get user profile API error: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
-# webhook_handler ga log qo'shing
 async def webhook_handler(request):
     global application
     
     if application:
         try:
             data = await request.json()
-            logger.info(f"📩 Webhook data: {data}")
             
             if 'callback_query' in data:
-                logger.info(f"👆 Callback query keldi: {data['callback_query']['data']}")
+                logger.info(f"👆 Callback: {data['callback_query']['data']}")
             
             update = Update.de_json(data, application.bot)
             await application.process_update(update)
@@ -2400,8 +1338,66 @@ async def webhook_handler(request):
     
     return web.Response(text='OK')
 
-async def init_webhook(app):
+# ==========================================
+# SCHEDULER & MAINTENANCE
+# ==========================================
+async def verify_webhook():
+    """Har 30 daqiqada webhook ni tekshirish va qayta o'rnatish"""
     global application
+    if not application or not application.bot:
+        return
+    
+    try:
+        webhook_info = await application.bot.get_webhook_info()
+        expected_url = f"{WEBHOOK_URL}/webhook"
+        
+        if webhook_info.url != expected_url:
+            logger.warning(f"⚠️ Webhook noto'g'ri: {webhook_info.url}")
+            await application.bot.set_webhook(
+                url=expected_url,
+                allowed_updates=['message', 'callback_query', 'edited_message']
+            )
+            logger.info("✅ Webhook qayta o'rnatildi")
+            
+        if webhook_info.pending_update_count > 10:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await asyncio.sleep(1)
+            await application.bot.set_webhook(url=expected_url)
+            logger.info(f"🧹 {webhook_info.pending_update_count} ta pending update tozalandi")
+            
+    except Exception as e:
+        logger.error(f"❌ Webhook tekshiruv xatosi: {e}")
+
+async def self_ping():
+    """Railway ni uyg'otish uchun self-ping"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'http://localhost:{PORT}/health') as resp:
+                if resp.status == 200:
+                    logger.debug("✅ Self-ping OK")
+    except Exception as e:
+        logger.error(f"Self-ping xato: {e}")
+
+async def cleanup_expired_states():
+    """Muddati o'tgan admin state larni tozalash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admin_states WHERE expires_at < CURRENT_TIMESTAMP")
+        conn.commit()
+        cur.close()
+        logger.info("🧹 Eski admin state lar tozalandi")
+    except Exception as e:
+        logger.error(f"State cleanup xatosi: {e}")
+    finally:
+        put_db_connection(conn)
+
+# ==========================================
+# INITIALIZATION
+# ==========================================
+async def init_webhook(app):
+    global application, scheduler
     
     if not TOKEN:
         logger.error("❌ TOKEN o'rnatilmagan!")
@@ -2411,50 +1407,35 @@ async def init_webhook(app):
         logger.error("❌ Database initialization failed!")
         return
     
-    # ⭐⭐⭐ YANGI: Body size limitini oshirish (100MB)
-    # aiohttp da default 1MB, biz 100MB qilamiz
-    from aiohttp import web
-    web.Request.MAX_CLIENT_SIZE = 100 * 1024 * 1024  # 100MB
-    
     # Bot application yaratish
     application = Application.builder().token(TOKEN).build()
     
-    # ==========================================
-    # HANDLERLAR - TARTIBI MUHIM!
-    # ==========================================
-    
-    # 1. COMMAND HANDLERS - eng muhimi bu yerda
+    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", stats_command))    
+    application.add_handler(CommandHandler("stats", show_stats))
     
-    # 2. MESSAGE HANDLERS
-    # Contact (telefon ulashish)
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # ⭐ TAYYORLANISH VAQTI - faqat admin va specific state uchun
-    # Bu handler callback dan KEYIN keladi, chunki callback query emas, matn xabar
-    application.add_handler(MessageHandler(
-        filters.TEXT & filters.User(user_id=ADMIN_CHAT_ID_INT) & ~filters.COMMAND,
-        prep_time_handler
-    ))
-    
-    # 3. CALLBACK QUERY HANDLER - oxirida
     application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # ==========================================
-    # BOT NI ISHGA TUSHIRISH
-    # ==========================================
-    
+    # Initialize
     await application.initialize()
     await application.start()
     
-    # Webhook o'rnatish
-    webhook_url = os.getenv("WEBHOOK_URL", "")
-    if webhook_url:
-        full_webhook_url = f"{webhook_url}/webhook"
+    # Eski webhook ni tozalash
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(2)
+        logger.info("🧹 Eski webhook tozalandi")
+    except Exception as e:
+        logger.warning(f"Eski webhook ni tozalash xatosi: {e}")
+    
+    # Yangi webhook o'rnatish
+    if WEBHOOK_URL:
+        full_webhook_url = f"{WEBHOOK_URL}/webhook"
         try:
             await application.bot.set_webhook(
                 url=full_webhook_url,
@@ -2464,10 +1445,19 @@ async def init_webhook(app):
         except Exception as e:
             logger.error(f"❌ Webhook xato: {e}")
     
+    # Scheduler ishga tushirish
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(verify_webhook, 'interval', minutes=30)
+    scheduler.add_job(self_ping, 'interval', minutes=5)  # Railway uchun
+    scheduler.add_job(cleanup_expired_states, 'interval', hours=1)
+    scheduler.start()
+    
     logger.info(f"🤖 Bot ishga tushdi! Admin ID: {ADMIN_CHAT_ID_INT}")
 
 async def shutdown(app):
-    global application
+    global application, scheduler
+    if scheduler:
+        scheduler.shutdown()
     if application:
         try:
             await application.stop()
@@ -2476,9 +1466,11 @@ async def shutdown(app):
         except Exception as e:
             logger.error(f"Shutdown xato: {e}")
 
+# ==========================================
+# MAIN
+# ==========================================
 def main():
     logger.info("🔧 Bodrum Bot starting...")
-    logger.info("💳 Payme chek parser + Auto accept tizimi faollashdi!")
     
     if not PORT:
         logger.error("❌ PORT o'rnatilmagan!")
@@ -2495,18 +1487,15 @@ def main():
                     headers={
                         'Access-Control-Allow-Origin': '*',
                         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma, Accept',
-                        'Access-Control-Max-Age': '86400',
+                        'Access-Control-Allow-Headers': '*',
                     }
                 )
             
             response = await handler(request)
             response.headers['Access-Control-Allow-Origin'] = '*'
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma, Accept'
-            
+            response.headers['Access-Control-Allow-Headers'] = '*'
             return response
-        
         return middleware_handler
     
     app.middlewares.append(cors_middleware)
@@ -2514,37 +1503,17 @@ def main():
     # Routes
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
-    
-    # API routes
     app.router.add_get('/api/orders', orders_list_handler)
     app.router.add_get('/api/orders/new', new_orders_handler)
     app.router.add_post('/api/orders', create_order_handler)
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
     app.router.add_put('/api/orders/{order_id}', update_order_handler)
-    
-    # User profile API
-    app.router.add_post('/api/user/profile', get_user_profile_api)
-    app.router.add_post('/api/user/save-profile', save_user_profile_api)
-    
-    # Webhook
     app.router.add_post('/webhook', webhook_handler)
     
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
     
-    # Menu API routes
-    app.router.add_get('/api/menu', get_menu_handler)
-    app.router.add_post('/api/menu', save_menu_handler)
-    app.router.add_get('/api/menu/last-update', get_categories_handler)  # Used for sync checking
-    
-    # Categories API routes
-    app.router.add_get('/api/categories', get_categories_handler)
-    app.router.add_post('/api/categories', save_categories_handler)
-    
-    logger.info(f"🚀 Server ishga tushmoqda: 0.0.0.0:{PORT}")
-    logger.info(f"💳 Payme chek parser: Faol")
-    logger.info(f"⚡ Auto accept: Faol")
-    
+    logger.info(f"🚀 Server: 0.0.0.0:{PORT}")
     web.run_app(app, host='0.0.0.0', port=PORT)
 
 if __name__ == "__main__":
